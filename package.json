@@ -1,0 +1,21 @@
+{
+  "name": "arccopilot-agent-proof-of-life",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "register-secret": "node scripts/register-secret.mjs",
+    "create-wallet": "node scripts/create-wallet.mjs",
+    "balance": "node scripts/balance.mjs",
+    "test-transfer": "node scripts/test-transfer.mjs",
+    "server": "node src/server.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@circle-fin/developer-controlled-wallets": "^10.7.1",
+    "dotenv": "^17.4.2"
+  }
+}

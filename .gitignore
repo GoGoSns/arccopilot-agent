@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+node_modules/
+wallet.json
+.circle/
+recovery_file_*.dat
+*.pem
+*-recovery-file.json
+policy.json
+ledger.json
+.token
