@@ -49,6 +49,7 @@ Runtime config:
 - `HOST` defaults to `0.0.0.0` when `PORT` is set, otherwise `127.0.0.1`.
 - `AGENT_BEARER_TOKEN` overrides `.token`.
 - `WALLET_ID` and `WALLET_ADDRESS` override `wallet.json`.
+- `DATABASE_URL` enables the new SIWE-style auth/session layer. If it is missing or unreachable, the server still boots in single-operator mode and logs a warning.
 - `WEEKLY_BUDGET`, `PER_TIP_CAP`, and `ALLOWLIST` override `policy.json`.
 
 Endpoints:
@@ -56,6 +57,10 @@ Endpoints:
 - `GET /health` -> `{ ok: true }`
 - `POST /agent/tip` with bearer auth and JSON body `{ "recipient": "...", "amount": "..." }`
 - `GET /agent/tip/:id` with bearer auth for Circle transaction polling
+- `POST /auth/nonce` with JSON body `{ "address": "0x..." }`
+- `POST /auth/verify` with JSON body `{ "address": "0x...", "signature": "0x..." }`
+- `POST /auth/refresh` with JSON body `{ "refreshToken": "..." }`
+- `GET /me` with `Authorization: Bearer <accessToken>`
 
 Policy is enforced from `policy.json` or the env overrides above:
 
@@ -64,6 +69,15 @@ Policy is enforced from `policy.json` or the env overrides above:
 - `allowlist`
 
 Successful tips are appended to `ledger.json` with timestamp and tx hash when the filesystem is writable.
+
+Auth/session notes:
+
+- `/auth/nonce` stores a 10-minute nonce in Postgres and returns a human-readable message to sign.
+- `/auth/verify` verifies the signature, upserts the user, and returns raw access and refresh tokens once.
+- Only SHA-256 hashes of access and refresh tokens are stored in `sessions`.
+- `/auth/refresh` rotates the access token and keeps the refresh token hash valid until expiry.
+- `/me` returns the authenticated `userId` and `walletAddress`.
+- The existing `/agent/tip` flow still uses the fixed `AGENT_BEARER_TOKEN` and the local `.token` fallback exactly as before.
 
 Deployment notes:
 
@@ -80,6 +94,7 @@ Set these env vars in Railway:
 - `WALLET_ID`
 - `WALLET_ADDRESS`
 - `AGENT_BEARER_TOKEN`
+- `DATABASE_URL`
 - `WEEKLY_BUDGET`
 - `PER_TIP_CAP`
 - `ALLOWLIST`

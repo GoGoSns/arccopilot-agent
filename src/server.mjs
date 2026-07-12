@@ -3,6 +3,15 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  buildAuthMessage,
+  generateNonce,
+  generateSessionToken,
+  hashToken,
+  normalizeAuthAddress,
+  recoverSignerAddress,
+} from './auth.mjs';
+import { closeDb, initDb, query, withTransaction } from './db.mjs';
+import {
   appendLedgerEntry,
   createCircleTipContext,
   fetchCircleTipStatus,
@@ -14,7 +23,7 @@ import {
   submitTipTransfer,
   sumLedgerSpendMicros,
 } from './arc-tip-service.mjs';
-import { normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
+import { loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
 
@@ -72,8 +81,8 @@ function sendNoContent(res, statusCode, headers = {}) {
   res.end();
 }
 
-function isAgentRoute(pathname) {
-  return pathname === '/agent' || pathname.startsWith('/agent/');
+function isCorsRoute(pathname) {
+  return pathname === '/me' || pathname === '/agent' || pathname.startsWith('/agent/') || pathname === '/auth' || pathname.startsWith('/auth/');
 }
 
 function getHeader(req, name) {
@@ -84,14 +93,19 @@ function getHeader(req, name) {
   return value ?? '';
 }
 
-function isAuthorized(req, bearerToken) {
+function extractBearerToken(req) {
   const header = String(getHeader(req, 'authorization') ?? '').trim();
   const match = header.match(/^Bearer\s+(.+)$/i);
-  if (!match) {
+  return match ? match[1].trim() : '';
+}
+
+function isAuthorized(req, bearerToken) {
+  const providedToken = extractBearerToken(req);
+  if (!providedToken) {
     return false;
   }
 
-  const provided = Buffer.from(match[1].trim());
+  const provided = Buffer.from(providedToken);
   const expected = Buffer.from(bearerToken);
   return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
 }
@@ -172,6 +186,8 @@ function validatePolicyTip(policy, ledger, recipient, amountMicros) {
 }
 
 async function createServerState() {
+  loadEnv();
+  await initDb();
   const [context, tokenInfo] = await Promise.all([createCircleTipContext(), loadOrCreateBearerToken()]);
   return {
     context,
@@ -199,6 +215,287 @@ function withExclusiveTipLock() {
 }
 
 const runExclusive = withExclusiveTipLock();
+
+function isDatabaseUnavailableError(error) {
+  const message = String(error?.message ?? error ?? '');
+  return message.includes('DATABASE_URL') || message.includes('Database query failed');
+}
+
+function isFutureTimestamp(value) {
+  const timestamp = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ''));
+  return Number.isFinite(timestamp) && timestamp > Date.now();
+}
+
+async function authMiddleware(req, res, responseHeaders) {
+  const accessToken = extractBearerToken(req);
+  if (!accessToken) {
+    sendError(res, 401, 'unauthorized', 'Missing or invalid bearer token.', {}, responseHeaders);
+    return null;
+  }
+
+  let result;
+  try {
+    result = await query(
+      'SELECT user_id, access_expires_at, revoked FROM sessions WHERE access_token_hash = $1 LIMIT 1',
+      [hashToken(accessToken)],
+    );
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return null;
+    }
+
+    throw error;
+  }
+
+  const session = result.rows[0];
+  if (!session || session.revoked || !isFutureTimestamp(session.access_expires_at)) {
+    sendError(res, 401, 'unauthorized', 'Missing or invalid bearer token.', {}, responseHeaders);
+    return null;
+  }
+
+  req.userId = session.user_id;
+  return session;
+}
+
+async function handleAuthNoncePost(req, res, responseHeaders) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  let address;
+  try {
+    address = normalizeAuthAddress(body?.address);
+  } catch (error) {
+    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
+    return;
+  }
+
+  const nonce = generateNonce();
+  const message = buildAuthMessage({ address, nonce });
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  try {
+    await query(
+      'INSERT INTO auth_nonces (wallet_address, nonce, created_at, expires_at, consumed) VALUES ($1, $2, NOW(), $3, FALSE)',
+      [address, nonce, expiresAt],
+    );
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+
+  sendJson(res, 200, { nonce, message }, responseHeaders);
+}
+
+async function handleAuthVerifyPost(req, res, responseHeaders) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  let address;
+  try {
+    address = normalizeAuthAddress(body?.address);
+  } catch (error) {
+    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
+    return;
+  }
+
+  const signature = String(body?.signature ?? '').trim();
+  if (!signature) {
+    sendError(res, 400, 'invalid_request', 'Missing signature.', {}, responseHeaders);
+    return;
+  }
+
+  try {
+    const result = await withTransaction(async (client) => {
+      const nonceResult = await client.query(
+        `SELECT id, nonce
+         FROM auth_nonces
+         WHERE wallet_address = $1
+           AND consumed = FALSE
+           AND expires_at > NOW()
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [address],
+      );
+
+      const nonceRow = nonceResult.rows[0];
+      if (!nonceRow) {
+        throw new HttpError(401, 'Invalid or expired authentication nonce.', {}, 'unauthorized');
+      }
+
+      const message = buildAuthMessage({ address, nonce: nonceRow.nonce });
+      let recoveredAddress;
+      try {
+        recoveredAddress = recoverSignerAddress({ message, signature });
+      } catch {
+        throw new HttpError(401, 'Invalid signature.', {}, 'unauthorized');
+      }
+
+      if (recoveredAddress !== address) {
+        throw new HttpError(401, 'Invalid signature.', {}, 'unauthorized');
+      }
+
+      await client.query('UPDATE auth_nonces SET consumed = TRUE WHERE id = $1', [nonceRow.id]);
+
+      const userResult = await client.query(
+        `INSERT INTO users (wallet_address, created_at, last_seen_at)
+         VALUES ($1, NOW(), NOW())
+         ON CONFLICT (wallet_address)
+         DO UPDATE SET last_seen_at = NOW()
+         RETURNING id, wallet_address`,
+        [address],
+      );
+
+      const user = userResult.rows[0];
+      const accessToken = generateSessionToken();
+      const refreshToken = generateSessionToken();
+      const accessExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      const refreshExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+      await client.query(
+        `INSERT INTO sessions (
+          user_id,
+          access_token_hash,
+          refresh_token_hash,
+          access_expires_at,
+          refresh_expires_at,
+          created_at,
+          revoked
+        ) VALUES ($1, $2, $3, $4, $5, NOW(), FALSE)`,
+        [
+          user.id,
+          hashToken(accessToken),
+          hashToken(refreshToken),
+          accessExpiresAt,
+          refreshExpiresAt,
+        ],
+      );
+
+      return {
+        userId: user.id,
+        accessToken,
+        refreshToken,
+      };
+    });
+
+    sendJson(res, 200, result, responseHeaders);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    sendError(res, 500, 'internal_error', 'Authentication failed.', {}, responseHeaders);
+  }
+}
+
+async function handleAuthRefreshPost(req, res, responseHeaders) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  const refreshToken = String(body?.refreshToken ?? '').trim();
+  if (!refreshToken) {
+    sendError(res, 400, 'invalid_request', 'Missing refreshToken.', {}, responseHeaders);
+    return;
+  }
+
+  const accessToken = generateSessionToken();
+  const accessTokenHash = hashToken(accessToken);
+  const accessExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+  try {
+    const result = await query(
+      `UPDATE sessions
+       SET access_token_hash = $1,
+           access_expires_at = $2
+       WHERE refresh_token_hash = $3
+         AND refresh_expires_at > NOW()
+         AND revoked = FALSE
+       RETURNING user_id`,
+      [accessTokenHash, accessExpiresAt, hashToken(refreshToken)],
+    );
+
+    if (result.rowCount === 0) {
+      sendError(res, 401, 'unauthorized', 'Invalid or expired refresh token.', {}, responseHeaders);
+      return;
+    }
+
+    sendJson(res, 200, { accessToken }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    sendError(res, 500, 'internal_error', 'Token refresh failed.', {}, responseHeaders);
+  }
+}
+
+async function handleMeGet(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  try {
+    const result = await query(
+      'SELECT wallet_address FROM users WHERE id = $1',
+      [req.userId],
+    );
+
+    const user = result.rows[0];
+    if (!user) {
+      sendError(res, 404, 'not_found', 'User not found.', {}, responseHeaders);
+      return;
+    }
+
+    sendJson(res, 200, {
+      userId: req.userId,
+      walletAddress: user.wallet_address,
+    }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
 
 async function handleTipPost(req, res, state, responseHeaders) {
   if (!isAuthorized(req, state.token)) {
@@ -320,9 +617,9 @@ async function handleTipStatus(req, res, state, pathname, responseHeaders) {
 async function requestHandler(req, res, state) {
   try {
     const pathname = normalizePath(new URL(req.url ?? '/', `http://${req.headers.host ?? resolveServerHost()}`).pathname);
-    const responseHeaders = isAgentRoute(pathname) ? corsHeaders : undefined;
+    const responseHeaders = isCorsRoute(pathname) ? corsHeaders : undefined;
 
-    if (req.method === 'OPTIONS' && isAgentRoute(pathname)) {
+    if (req.method === 'OPTIONS' && isCorsRoute(pathname)) {
       sendNoContent(res, 204, responseHeaders);
       return;
     }
@@ -337,6 +634,26 @@ async function requestHandler(req, res, state) {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/auth/nonce') {
+      await handleAuthNoncePost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/verify') {
+      await handleAuthVerifyPost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/refresh') {
+      await handleAuthRefreshPost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/me') {
+      await handleMeGet(req, res, responseHeaders);
+      return;
+    }
+
     if (req.method === 'GET' && routeMatchesTipStatus(pathname)) {
       await handleTipStatus(req, res, state, pathname, responseHeaders);
       return;
@@ -345,7 +662,7 @@ async function requestHandler(req, res, state) {
     sendError(res, 404, 'not_found', 'Route not found.', {}, responseHeaders);
   } catch (error) {
     const pathname = normalizePath(new URL(req.url ?? '/', `http://${req.headers.host ?? resolveServerHost()}`).pathname);
-    const responseHeaders = isAgentRoute(pathname) ? corsHeaders : undefined;
+    const responseHeaders = isCorsRoute(pathname) ? corsHeaders : undefined;
 
     if (error instanceof HttpError) {
       sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
@@ -384,7 +701,10 @@ export async function startServer({ host = resolveServerHost(), port = resolveSe
     token: state.token,
     tokenSource: state.tokenSource,
     context: state.context,
-    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    close: async () => {
+      await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      await closeDb();
+    },
   };
 }
 
