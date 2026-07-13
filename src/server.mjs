@@ -10,6 +10,10 @@ import {
   normalizeAuthAddress,
   recoverSignerAddress,
 } from './auth.mjs';
+import {
+  ensureAgentWallet,
+  getAgentWalletProfile,
+} from './agentProvision.mjs';
 import { closeDb, initDb, query, withTransaction } from './db.mjs';
 import {
   appendLedgerEntry,
@@ -26,6 +30,8 @@ import {
 import { loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
+const authWalletProvisionTimeoutMs = 8000;
+const manualWalletProvisionTimeoutMs = 20000;
 
 function resolveServerHost() {
   return process.env.HOST ?? (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
@@ -226,6 +232,47 @@ function isFutureTimestamp(value) {
   return Number.isFinite(timestamp) && timestamp > Date.now();
 }
 
+async function attemptAgentWalletProvision(userId, timeoutMs, context) {
+  const trackedProvision = ensureAgentWallet(userId).then(
+    (profile) => ({ status: 'fulfilled', profile }),
+    (error) => {
+      console.warn(`[agent-wallet] ${context} failed for user ${userId}: ${normalizeCircleError(error).text}`);
+      return { status: 'rejected' };
+    },
+  );
+
+  let timeoutId;
+  const timeout = new Promise((resolve) => {
+    timeoutId = setTimeout(() => resolve({ status: 'timeout' }), timeoutMs);
+  });
+
+  const result = await Promise.race([trackedProvision, timeout]);
+  clearTimeout(timeoutId);
+
+  if (result.status === 'timeout') {
+    console.warn(`[agent-wallet] ${context} timed out for user ${userId} after ${timeoutMs}ms.`);
+    return {
+      walletReady: false,
+      timedOut: true,
+      profile: null,
+    };
+  }
+
+  if (result.status === 'fulfilled') {
+    return {
+      walletReady: true,
+      timedOut: false,
+      profile: result.profile,
+    };
+  }
+
+  return {
+    walletReady: false,
+    timedOut: false,
+    profile: null,
+  };
+}
+
 async function authMiddleware(req, res, responseHeaders) {
   const accessToken = extractBearerToken(req);
   if (!accessToken) {
@@ -399,7 +446,16 @@ async function handleAuthVerifyPost(req, res, responseHeaders) {
       };
     });
 
-    sendJson(res, 200, result, responseHeaders);
+    const provisioning = await attemptAgentWalletProvision(
+      result.userId,
+      authWalletProvisionTimeoutMs,
+      'Authentication-time provisioning',
+    );
+
+    sendJson(res, 200, {
+      ...result,
+      walletReady: provisioning.walletReady,
+    }, responseHeaders);
   } catch (error) {
     if (error instanceof HttpError) {
       sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
@@ -472,21 +528,43 @@ async function handleMeGet(req, res, responseHeaders) {
   }
 
   try {
-    const result = await query(
-      'SELECT wallet_address FROM users WHERE id = $1',
-      [req.userId],
-    );
-
-    const user = result.rows[0];
-    if (!user) {
+    const profile = await getAgentWalletProfile(req.userId);
+    if (!profile) {
       sendError(res, 404, 'not_found', 'User not found.', {}, responseHeaders);
       return;
     }
 
-    sendJson(res, 200, {
-      userId: req.userId,
-      walletAddress: user.wallet_address,
-    }, responseHeaders);
+    sendJson(res, 200, profile, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleAgentProvisionPost(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  try {
+    const attempt = await attemptAgentWalletProvision(
+      req.userId,
+      manualWalletProvisionTimeoutMs,
+      'Manual provisioning',
+    );
+
+    const profile = attempt.profile ?? await getAgentWalletProfile(req.userId);
+    if (!profile) {
+      sendError(res, 404, 'not_found', 'User not found.', {}, responseHeaders);
+      return;
+    }
+
+    sendJson(res, 200, profile, responseHeaders);
   } catch (error) {
     if (isDatabaseUnavailableError(error)) {
       sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
@@ -646,6 +724,11 @@ async function requestHandler(req, res, state) {
 
     if (req.method === 'POST' && pathname === '/auth/refresh') {
       await handleAuthRefreshPost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/agent/provision') {
+      await handleAgentProvisionPost(req, res, responseHeaders);
       return;
     }
 

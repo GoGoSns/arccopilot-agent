@@ -58,9 +58,10 @@ Endpoints:
 - `POST /agent/tip` with bearer auth and JSON body `{ "recipient": "...", "amount": "..." }`
 - `GET /agent/tip/:id` with bearer auth for Circle transaction polling
 - `POST /auth/nonce` with JSON body `{ "address": "0x..." }`
-- `POST /auth/verify` with JSON body `{ "address": "0x...", "signature": "0x..." }`
+- `POST /auth/verify` with JSON body `{ "address": "0x...", "signature": "0x..." }` and a `walletReady` flag in the response
 - `POST /auth/refresh` with JSON body `{ "refreshToken": "..." }`
 - `GET /me` with `Authorization: Bearer <accessToken>`
+- `POST /agent/provision` with `Authorization: Bearer <accessToken>` to retry wallet setup manually
 
 Policy is enforced from `policy.json` or the env overrides above:
 
@@ -73,10 +74,11 @@ Successful tips are appended to `ledger.json` with timestamp and tx hash when th
 Auth/session notes:
 
 - `/auth/nonce` stores a 10-minute nonce in Postgres and returns a human-readable message to sign.
-- `/auth/verify` verifies the signature, upserts the user, and returns raw access and refresh tokens once.
+- `/auth/verify` verifies the signature, upserts the user, creates the user session, and best-effort provisions a per-user Circle W3S wallet. If Circle is slow or fails, the login still succeeds and `walletReady` comes back `false`.
 - Only SHA-256 hashes of access and refresh tokens are stored in `sessions`.
 - `/auth/refresh` rotates the access token and keeps the refresh token hash valid until expiry.
-- `/me` returns the authenticated `userId` and `walletAddress`.
+- `/me` returns the authenticated `userId`, the user's MetaMask `walletAddress`, the per-user `agentAddress`, `agentWalletReady`, and the current policy view.
+- `/agent/provision` retries provisioning for the current user and returns the same wallet/profile view as `/me`.
 - The existing `/agent/tip` flow still uses the fixed `AGENT_BEARER_TOKEN` and the local `.token` fallback exactly as before.
 
 Deployment notes:
