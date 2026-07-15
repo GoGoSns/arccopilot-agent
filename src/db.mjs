@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { normalizeCircleError } from '../scripts/shared.mjs';
+import { isCircleApiError, normalizeCircleError } from '../scripts/shared.mjs';
 
 const { Pool } = pg;
 
@@ -53,8 +53,20 @@ export async function query(text, values = []) {
   try {
     return await activePool.query(text, values);
   } catch (error) {
+    if (isCircleApiError(error)) {
+      throw wrapCircleError(error);
+    }
+
     throw new Error(`Database query failed: ${normalizeCircleError(error).text}`);
   }
+}
+
+function wrapCircleError(error) {
+  const details = normalizeCircleError(error);
+  const circleError = new Error(`Circle API error: ${details.message}`);
+  circleError.status = details.status;
+  circleError.circleBody = details.body;
+  return circleError;
 }
 
 export async function withTransaction(handler) {
@@ -80,6 +92,10 @@ export async function withTransaction(handler) {
     }
     if (error && typeof error.statusCode === 'number') {
       throw error;
+    }
+
+    if (isCircleApiError(error)) {
+      throw wrapCircleError(error);
     }
 
     throw new Error(`Database query failed: ${normalizeCircleError(error).text}`);

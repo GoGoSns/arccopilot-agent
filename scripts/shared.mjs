@@ -64,6 +64,11 @@ export function normalizeCircleError(error) {
   };
 }
 
+export function isCircleApiError(error) {
+  // Circle SDK HTTP errors set a numeric `.status`; pg DatabaseError never does.
+  return Boolean(error) && typeof error.status === 'number';
+}
+
 export function isArcTestnetRejected(error) {
   const text = normalizeCircleError(error).text.toLowerCase();
   return text.includes('arc-testnet') && (

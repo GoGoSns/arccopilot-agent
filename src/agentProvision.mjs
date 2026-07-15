@@ -25,11 +25,21 @@ function getCircleWalletClient() {
   return walletClient;
 }
 
-function buildIdempotencyKey(userId, purpose) {
-  return crypto
+// Circle's API validates idempotencyKey as a UUID (the SDK itself defaults to
+// crypto.randomUUID() when one isn't supplied). A raw sha256 hex digest is not
+// UUID-shaped and Circle rejects it with HTTP 400 "API parameter invalid".
+// Format the hash as a UUID (v4 layout) so retries stay deterministic per
+// scope/purpose while remaining valid input to the API.
+function buildIdempotencyKey(scope, purpose) {
+  const hash = crypto
     .createHash('sha256')
-    .update(`agent-wallet:${purpose}:${String(userId)}`)
-    .digest('hex');
+    .update(`agent-wallet:${purpose}:${String(scope)}`)
+    .digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function normalizeNumber(value) {
@@ -82,17 +92,36 @@ function extractWalletSetId(response) {
   return response?.data?.walletSet?.id ?? response?.data?.id ?? null;
 }
 
-async function createCircleWallet(userId) {
+// One wallet set backs the whole app (matches scripts/create-wallet.mjs's
+// proven flow); every user gets their own wallet inside it. The idempotency
+// key is fixed (not per-user) so concurrent/retried provisioning calls all
+// resolve to the same Circle-side wallet set instead of creating a new one
+// each time.
+let cachedWalletSetId;
+
+async function getOrCreateWalletSetId() {
+  if (cachedWalletSetId) {
+    return cachedWalletSetId;
+  }
+
   const client = getCircleWalletClient();
   const walletSetResponse = await client.createWalletSet({
-    name: `ArcCopilot agent wallet ${String(userId)}`,
-    idempotencyKey: buildIdempotencyKey(userId, 'wallet-set'),
+    name: 'ArcCopilot agent wallets',
+    idempotencyKey: buildIdempotencyKey('app', 'wallet-set'),
   });
 
   const walletSetId = extractWalletSetId(walletSetResponse);
   if (!walletSetId) {
     throw new Error('createWalletSet did not return a wallet set id.');
   }
+
+  cachedWalletSetId = walletSetId;
+  return walletSetId;
+}
+
+async function createCircleWallet(userId) {
+  const client = getCircleWalletClient();
+  const walletSetId = await getOrCreateWalletSetId();
 
   const walletsResponse = await client.createWallets({
     walletSetId,
@@ -175,33 +204,24 @@ export async function ensureAgentWallet(userId) {
     );
     let walletRow = walletResult.rows[0] ?? null;
 
-    if (!walletRow) {
+    // Retry-safe: a prior failed attempt never leaves a partial row (the
+    // insert only runs after Circle returns both id and address together),
+    // but guard for it anyway so a retry can't get stuck on half-state.
+    const needsWallet = !walletRow || !walletRow.circle_wallet_id || !walletRow.agent_address;
+
+    if (needsWallet) {
       const wallet = await createCircleWallet(userId);
-      const insertWalletResult = await client.query(
+      const upsertWalletResult = await client.query(
         `INSERT INTO agent_wallets (user_id, circle_wallet_id, agent_address)
          VALUES ($1, $2, $3)
-         ON CONFLICT (user_id) DO NOTHING
+         ON CONFLICT (user_id) DO UPDATE SET
+           circle_wallet_id = COALESCE(agent_wallets.circle_wallet_id, EXCLUDED.circle_wallet_id),
+           agent_address = COALESCE(agent_wallets.agent_address, EXCLUDED.agent_address)
          RETURNING user_id, circle_wallet_id, agent_address`,
         [userId, wallet.circleWalletId, wallet.agentAddress],
       );
 
-      if (insertWalletResult.rowCount === 0) {
-        const existingWalletResult = await client.query(
-          `SELECT user_id, circle_wallet_id, agent_address
-           FROM agent_wallets
-           WHERE user_id = $1
-           LIMIT 1`,
-          [userId],
-        );
-
-        if (existingWalletResult.rowCount === 0) {
-          throw new Error('Failed to persist agent wallet.');
-        }
-
-        walletRow = existingWalletResult.rows[0];
-      } else {
-        walletRow = insertWalletResult.rows[0];
-      }
+      walletRow = upsertWalletResult.rows[0];
     }
 
     await client.query(
