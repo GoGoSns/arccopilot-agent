@@ -314,6 +314,8 @@ function extractTransactionSnapshot(response) {
     id: transaction?.id ?? response?.data?.id ?? '',
     state: transaction?.state ?? transaction?.transactionState ?? transaction?.status ?? '',
     txHash: transaction?.txHash ?? transaction?.transactionHash ?? transaction?.hash ?? '',
+    errorReason: transaction?.errorReason ?? transaction?.error_reason ?? '',
+    errorDetails: transaction?.errorDetails ?? transaction?.error_details ?? '',
     transaction,
   };
 }
@@ -325,6 +327,8 @@ export async function fetchCircleTipStatus(client, txId) {
     id: snapshot.id || txId,
     state: snapshot.state || 'UNKNOWN',
     txHash: snapshot.txHash || null,
+    errorReason: snapshot.errorReason || null,
+    errorDetails: snapshot.errorDetails || null,
     arcscanUrl: snapshot.txHash ? `${arcScanTxBaseUrl}${snapshot.txHash}` : null,
     transaction: snapshot.transaction,
   };
@@ -350,6 +354,8 @@ export async function waitForCircleTipCompletion(client, txId, { pollIntervalMs 
         id: status.id || txId,
         state: status.state,
         txHash: txHash || null,
+        errorReason: status.errorReason ?? null,
+        errorDetails: status.errorDetails ?? null,
         arcscanUrl: txHash ? `${arcScanTxBaseUrl}${txHash}` : null,
       };
     }
@@ -363,15 +369,21 @@ export async function submitTipTransfer(
   {
     recipient,
     amount,
+    walletId = context.walletId,
     idempotencyKey = crypto.randomUUID(),
     pollIntervalMs = 5000,
     onState,
   } = {},
 ) {
+  const sourceWalletId = String(walletId ?? '').trim();
+  if (!sourceWalletId) {
+    throw new Error('walletId is required to submit a transfer.');
+  }
+
   const normalizedRecipient = validateRecipientAddress(recipient);
   const normalizedAmount = validatePositiveAmount(String(amount).trim());
   const createResponse = await context.client.createTransaction({
-    walletId: context.walletId,
+    walletId: sourceWalletId,
     blockchain: arcBlockchain,
     tokenAddress: arcUsdcTokenAddress,
     destinationAddress: normalizedRecipient,

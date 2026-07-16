@@ -27,7 +27,7 @@ import {
   submitTipTransfer,
   sumLedgerSpendMicros,
 } from './arc-tip-service.mjs';
-import { loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
+import { isCircleApiError, loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
 const authWalletProvisionTimeoutMs = 8000;
@@ -44,7 +44,7 @@ function resolveServerPort() {
 
 const corsHeaders = Object.freeze({
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Authorization, Content-Type',
   'Access-Control-Max-Age': '86400',
 });
@@ -88,7 +88,7 @@ function sendNoContent(res, statusCode, headers = {}) {
 }
 
 function isCorsRoute(pathname) {
-  return pathname === '/me' || pathname === '/agent' || pathname.startsWith('/agent/') || pathname === '/auth' || pathname.startsWith('/auth/');
+  return pathname === '/me' || pathname.startsWith('/me/') || pathname === '/agent' || pathname.startsWith('/agent/') || pathname === '/auth' || pathname.startsWith('/auth/');
 }
 
 function getHeader(req, name) {
@@ -191,6 +191,251 @@ function validatePolicyTip(policy, ledger, recipient, amountMicros) {
   return normalizedRecipient;
 }
 
+const ledgerFailureReasonColumns = ['failure_reason', 'reason', 'error_reason', 'error_message', 'failure_message'];
+
+function normalizeNumber(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : value;
+}
+
+function normalizeBoolean(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === 'true' || normalized === 't' || normalized === '1' || normalized === 'yes') {
+    return true;
+  }
+
+  if (normalized === 'false' || normalized === 'f' || normalized === '0' || normalized === 'no') {
+    return false;
+  }
+
+  return Boolean(value);
+}
+
+function normalizePolicyRow(row) {
+  return {
+    weeklyBudget: normalizeNumber(row?.weekly_budget ?? row?.weeklyBudget),
+    perTipCap: normalizeNumber(row?.per_tip_cap ?? row?.perTipCap),
+    autonomousEnabled: normalizeBoolean(row?.autonomous_enabled ?? row?.autonomousEnabled),
+  };
+}
+
+function normalizeAllowlistRow(row) {
+  return {
+    recipient: String(row?.recipient ?? row?.recipient_address ?? '').trim().toLowerCase(),
+    label: row?.label ?? null,
+  };
+}
+
+function normalizeLedgerRow(row) {
+  return {
+    id: row?.id ?? null,
+    recipient: row?.recipient ?? null,
+    amount: row?.amount !== undefined && row?.amount !== null ? String(row.amount) : null,
+    status: row?.status ?? null,
+    txHash: row?.tx_hash ?? row?.txHash ?? null,
+    createdAt: row?.created_at ?? row?.createdAt ?? null,
+  };
+}
+
+function normalizeTipFailure(status) {
+  const parts = [];
+  if (status?.errorReason) {
+    parts.push(String(status.errorReason).trim());
+  }
+  if (status?.errorDetails) {
+    parts.push(String(status.errorDetails).trim());
+  }
+  if (parts.length > 0) {
+    return parts.join(': ');
+  }
+  return `Circle returned terminal state ${String(status?.state ?? 'UNKNOWN').toUpperCase()}.`;
+}
+
+function normalizePolicyInputValue(value, fieldName) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return null;
+  }
+
+  return validatePositiveAmount(String(value).trim(), fieldName);
+}
+
+function isDatabaseUnavailableError(error) {
+  const message = String(error?.message ?? error ?? '');
+  return message.includes('DATABASE_URL') || message.includes('Database query failed');
+}
+
+function isFutureTimestamp(value) {
+  const timestamp = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ''));
+  return Number.isFinite(timestamp) && timestamp > Date.now();
+}
+
+async function loadUserPolicyBundle(clientOrUserId, maybeUserId) {
+  const client = maybeUserId === undefined ? null : clientOrUserId;
+  const userId = maybeUserId === undefined ? clientOrUserId : maybeUserId;
+  const runner = client ?? { query };
+
+  const [policyResult, allowlistResult] = await Promise.all([
+    runner.query(
+      `SELECT weekly_budget, per_tip_cap, autonomous_enabled
+       FROM policies
+       WHERE user_id = $1
+       LIMIT 1`,
+      [userId],
+    ),
+    runner.query(
+      `SELECT recipient, label
+       FROM allowlist
+       WHERE user_id = $1`,
+      [userId],
+    ),
+  ]);
+
+  return {
+    policyRow: policyResult.rows[0] ?? null,
+    allowlistRows: allowlistResult.rows.map(normalizeAllowlistRow),
+  };
+}
+
+async function loadLedgerSpendMicrosForUser(client, userId) {
+  const result = await client.query(
+    `SELECT COALESCE(SUM(amount::numeric), 0)::text AS total
+     FROM ledger
+     WHERE user_id = $1
+       AND status = 'complete'
+       AND created_at >= NOW() - INTERVAL '7 days'`,
+    [userId],
+  );
+
+  const totalText = String(result.rows[0]?.total ?? '0').trim();
+  if (!totalText || Number(totalText) === 0) {
+    return 0n;
+  }
+
+  return parseUsdcAmountToMicros(totalText, 'ledger.total');
+}
+
+async function resolveLedgerFailureReasonColumn(client) {
+  const result = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'ledger'`,
+  );
+
+  const columns = new Set(result.rows.map((row) => String(row.column_name).toLowerCase()));
+  return ledgerFailureReasonColumns.find((column) => columns.has(column)) ?? null;
+}
+
+async function insertPendingLedgerRow(client, userId, recipient, amountText) {
+  const result = await client.query(
+    `INSERT INTO ledger (user_id, recipient, amount, status, created_at)
+     VALUES ($1, $2, $3, 'pending', NOW())
+     RETURNING id`,
+    [userId, recipient, amountText],
+  );
+
+  return result.rows[0]?.id ?? null;
+}
+
+async function markLedgerTipComplete(ledgerId, txHash) {
+  await query(
+    `UPDATE ledger
+     SET status = 'complete',
+         tx_hash = $1
+     WHERE id = $2`,
+    [txHash, ledgerId],
+  );
+}
+
+async function markLedgerTipFailed(ledgerId, txHash, reason) {
+  await withTransaction(async (client) => {
+    const reasonColumn = await resolveLedgerFailureReasonColumn(client);
+    if (reasonColumn) {
+      await client.query(
+        `UPDATE ledger
+         SET status = 'failed',
+             tx_hash = COALESCE($1, tx_hash),
+             ${reasonColumn} = $2
+         WHERE id = $3`,
+        [txHash, reason, ledgerId],
+      );
+      return;
+    }
+
+    await client.query(
+      `UPDATE ledger
+       SET status = 'failed',
+           tx_hash = COALESCE($1, tx_hash)
+       WHERE id = $2`,
+      [txHash, ledgerId],
+    );
+  });
+}
+
+function buildResolvedPolicyPayload(currentPolicyRow, body) {
+  const currentPolicy = currentPolicyRow ? normalizePolicyRow(currentPolicyRow) : { ...defaultAgentPolicy };
+
+  const weeklyBudgetText = normalizePolicyInputValue(body?.weeklyBudget, 'weeklyBudget') ?? String(currentPolicy.weeklyBudget ?? defaultAgentPolicy.weeklyBudget);
+  const perTipCapText = normalizePolicyInputValue(body?.perTipCap, 'perTipCap') ?? String(currentPolicy.perTipCap ?? defaultAgentPolicy.perTipCap);
+  const autonomousEnabled = body?.autonomousEnabled !== undefined && body?.autonomousEnabled !== null
+    ? normalizeBoolean(body.autonomousEnabled)
+    : (currentPolicy.autonomousEnabled ?? defaultAgentPolicy.autonomousEnabled);
+
+  const weeklyBudgetMicros = parseUsdcAmountToMicros(weeklyBudgetText, 'weeklyBudget');
+  const perTipCapMicros = parseUsdcAmountToMicros(perTipCapText, 'perTipCap');
+
+  if (perTipCapMicros > weeklyBudgetMicros) {
+    throw new HttpError(400, 'perTipCap must be less than or equal to weeklyBudget.', {
+      weeklyBudget: formatUsdcAmount(weeklyBudgetMicros),
+      perTipCap: formatUsdcAmount(perTipCapMicros),
+    }, 'invalid_request');
+  }
+
+  return {
+    weeklyBudget: weeklyBudgetText,
+    perTipCap: perTipCapText,
+    autonomousEnabled,
+  };
+}
+
+async function loadUserAutonomousTipState(client, userId) {
+  const walletResult = await client.query(
+    `SELECT circle_wallet_id, agent_address
+     FROM agent_wallets
+     WHERE user_id = $1
+     LIMIT 1`,
+    [userId],
+  );
+  const walletRow = walletResult.rows[0] ?? null;
+
+  const { policyRow, allowlistRows } = await loadUserPolicyBundle(client, userId);
+  const policy = buildResolvedPolicyPayload(policyRow, {});
+  const spendMicros = await loadLedgerSpendMicrosForUser(client, userId);
+
+  return {
+    walletRow,
+    policy,
+    allowlistRows,
+    spendMicros,
+  };
+}
+
 async function createServerState() {
   loadEnv();
   await initDb();
@@ -221,16 +466,6 @@ function withExclusiveTipLock() {
 }
 
 const runExclusive = withExclusiveTipLock();
-
-function isDatabaseUnavailableError(error) {
-  const message = String(error?.message ?? error ?? '');
-  return message.includes('DATABASE_URL') || message.includes('Database query failed');
-}
-
-function isFutureTimestamp(value) {
-  const timestamp = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ''));
-  return Number.isFinite(timestamp) && timestamp > Date.now();
-}
 
 async function attemptAgentWalletProvision(userId, timeoutMs, context) {
   const trackedProvision = ensureAgentWallet(userId).then(
@@ -575,6 +810,369 @@ async function handleAgentProvisionPost(req, res, responseHeaders) {
   }
 }
 
+async function handleMePolicyGet(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  try {
+    const { policyRow, allowlistRows } = await loadUserPolicyBundle(null, req.userId);
+    const policy = policyRow ? normalizePolicyRow(policyRow) : { ...defaultAgentPolicy };
+
+    sendJson(res, 200, {
+      ...policy,
+      allowlist: allowlistRows,
+    }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleMePolicyPut(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  try {
+    const result = await withTransaction(async (client) => {
+      const existingResult = await client.query(
+        `SELECT weekly_budget, per_tip_cap, autonomous_enabled
+         FROM policies
+         WHERE user_id = $1
+         LIMIT 1`,
+        [req.userId],
+      );
+      const resolved = buildResolvedPolicyPayload(existingResult.rows[0] ?? null, body);
+
+      await client.query(
+        `INSERT INTO policies (user_id, weekly_budget, per_tip_cap, autonomous_enabled)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id) DO UPDATE SET
+           weekly_budget = EXCLUDED.weekly_budget,
+           per_tip_cap = EXCLUDED.per_tip_cap,
+           autonomous_enabled = EXCLUDED.autonomous_enabled
+         RETURNING weekly_budget, per_tip_cap, autonomous_enabled`,
+        [
+          req.userId,
+          resolved.weeklyBudget,
+          resolved.perTipCap,
+          resolved.autonomousEnabled,
+        ],
+      );
+
+      const refreshed = await client.query(
+        `SELECT weekly_budget, per_tip_cap, autonomous_enabled
+         FROM policies
+         WHERE user_id = $1
+         LIMIT 1`,
+        [req.userId],
+      );
+
+      return normalizePolicyRow(refreshed.rows[0] ?? null);
+    });
+
+    sendJson(res, 200, result, responseHeaders);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleMeAllowlistPost(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  let recipient;
+  try {
+    recipient = validateRecipientAddress(String(body?.recipient ?? '').trim()).toLowerCase();
+  } catch (error) {
+    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
+    return;
+  }
+
+  const labelText = body?.label !== undefined && body?.label !== null ? String(body.label).trim() : '';
+  const label = labelText ? labelText : null;
+
+  try {
+    const result = await query(
+      `INSERT INTO allowlist (user_id, recipient, label)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, recipient) DO UPDATE SET
+         label = COALESCE(EXCLUDED.label, allowlist.label)
+       RETURNING recipient, label`,
+      [req.userId, recipient, label],
+    );
+
+    sendJson(res, 200, {
+      ...normalizeAllowlistRow(result.rows[0] ?? { recipient, label }),
+    }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleMeAllowlistDelete(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  let recipient;
+  try {
+    recipient = validateRecipientAddress(String(body?.recipient ?? '').trim()).toLowerCase();
+  } catch (error) {
+    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
+    return;
+  }
+
+  try {
+    await query(
+      'DELETE FROM allowlist WHERE user_id = $1 AND recipient = $2',
+      [req.userId, recipient],
+    );
+    sendJson(res, 200, { recipient, removed: true }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleMeLedgerGet(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  try {
+    const result = await query(
+      `SELECT id, recipient, amount::text AS amount, status, tx_hash, created_at
+       FROM ledger
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [req.userId],
+    );
+
+    sendJson(res, 200, {
+      ledger: result.rows.map(normalizeLedgerRow),
+    }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function handleMeTipPost(req, res, state, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+
+  let recipient;
+  let amountText;
+  let amountMicros;
+  try {
+    recipient = validateRecipientAddress(String(body?.recipient ?? '').trim()).toLowerCase();
+    amountText = validatePositiveAmount(String(body?.amount ?? '').trim());
+    amountMicros = parseUsdcAmountToMicros(amountText, 'amount');
+  } catch (error) {
+    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
+    return;
+  }
+
+  let prep;
+  try {
+    prep = await withTransaction(async (client) => {
+      const stateBundle = await loadUserAutonomousTipState(client, req.userId);
+      const { walletRow, policy, allowlistRows, spendMicros } = stateBundle;
+
+      if (!walletRow || !walletRow.circle_wallet_id || !walletRow.agent_address) {
+        throw new HttpError(409, 'Your agent wallet is not provisioned yet. Call /agent/provision first.', {
+          hint: 'call /agent/provision first',
+        }, 'agent_wallet_not_provisioned');
+      }
+
+      if (!policy.autonomousEnabled) {
+        throw new HttpError(403, 'autonomous mode is off for this account', {}, 'autonomous_disabled');
+      }
+
+      const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
+      if (amountMicros > perTipCapMicros) {
+        throw new HttpError(400, `Amount exceeds your per-tip cap of ${formatUsdcAmount(perTipCapMicros)} USDC.`, {
+          perTipCap: formatUsdcAmount(perTipCapMicros),
+          amount: formatUsdcAmount(amountMicros),
+        }, 'invalid_request');
+      }
+
+      if (allowlistRows.length > 0 && !allowlistRows.some((entry) => entry.recipient === recipient)) {
+        throw new HttpError(400, 'recipient not in your allowlist', {
+          recipient,
+        }, 'invalid_request');
+      }
+
+      const weeklyBudgetMicros = parseUsdcAmountToMicros(String(policy.weeklyBudget), 'weeklyBudget');
+      if (spendMicros + amountMicros > weeklyBudgetMicros) {
+        const remainingMicros = weeklyBudgetMicros > spendMicros ? weeklyBudgetMicros - spendMicros : 0n;
+        throw new HttpError(400, `Weekly budget exceeded. Remaining budget: ${formatUsdcAmount(remainingMicros)} USDC.`, {
+          weeklyBudget: formatUsdcAmount(weeklyBudgetMicros),
+          weeklySpend: formatUsdcAmount(spendMicros),
+          requestedAmount: formatUsdcAmount(amountMicros),
+          remainingBudget: formatUsdcAmount(remainingMicros),
+        }, 'invalid_request');
+      }
+
+      const ledgerId = await insertPendingLedgerRow(client, req.userId, recipient, amountText);
+      if (!ledgerId) {
+        throw new Error('Failed to create a pending ledger row.');
+      }
+
+      return {
+        ledgerId,
+        walletId: walletRow.circle_wallet_id,
+        agentAddress: walletRow.agent_address,
+      };
+    });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+
+    throw error;
+  }
+
+  try {
+    const transfer = await submitTipTransfer(state.context, {
+      recipient,
+      amount: amountText,
+      walletId: prep.walletId,
+    });
+
+    if (String(transfer.state).toUpperCase() !== 'COMPLETE') {
+      const reason = normalizeTipFailure(transfer);
+      throw new HttpError(502, reason, {
+        state: transfer.state,
+        txHash: transfer.txHash ?? null,
+        arcscanUrl: transfer.arcscanUrl ?? null,
+      }, 'circle_upstream_error');
+    }
+
+    await markLedgerTipComplete(prep.ledgerId, transfer.txHash ?? null);
+
+    sendJson(res, 200, {
+      state: 'COMPLETE',
+      txHash: transfer.txHash ?? null,
+      arcscanUrl: transfer.arcscanUrl ?? null,
+    }, responseHeaders);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      try {
+        await markLedgerTipFailed(prep.ledgerId, error.details?.txHash ?? null, error.message);
+      } catch (markError) {
+        console.warn(`[ledger] Could not mark failed autonomous tip for user ${req.userId}: ${normalizeCircleError(markError).text}`);
+      }
+      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+      return;
+    }
+
+    const normalized = normalizeCircleError(error);
+    try {
+      await markLedgerTipFailed(prep.ledgerId, null, normalized.text);
+    } catch (markError) {
+      console.warn(`[ledger] Could not mark failed autonomous tip for user ${req.userId}: ${normalizeCircleError(markError).text}`);
+    }
+
+    sendError(
+      res,
+      isCircleApiError(error) || normalized.status ? 502 : 500,
+      isCircleApiError(error) || normalized.status ? 'circle_upstream_error' : 'internal_error',
+      normalized.text,
+      {},
+      responseHeaders,
+    );
+  }
+}
+
 async function handleTipPost(req, res, state, responseHeaders) {
   if (!isAuthorized(req, state.token)) {
     sendError(res, 401, 'unauthorized', 'Missing or invalid bearer token.', {}, responseHeaders);
@@ -712,6 +1310,11 @@ async function requestHandler(req, res, state) {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/me/tip') {
+      await handleMeTipPost(req, res, state, responseHeaders);
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/auth/nonce') {
       await handleAuthNoncePost(req, res, responseHeaders);
       return;
@@ -734,6 +1337,31 @@ async function requestHandler(req, res, state) {
 
     if (req.method === 'GET' && pathname === '/me') {
       await handleMeGet(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/me/policy') {
+      await handleMePolicyGet(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'PUT' && pathname === '/me/policy') {
+      await handleMePolicyPut(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/me/allowlist') {
+      await handleMeAllowlistPost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'DELETE' && pathname === '/me/allowlist') {
+      await handleMeAllowlistDelete(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/me/ledger') {
+      await handleMeLedgerGet(req, res, responseHeaders);
       return;
     }
 
