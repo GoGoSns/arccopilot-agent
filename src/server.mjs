@@ -312,8 +312,12 @@ async function loadUserPolicyBundle(clientOrUserId, maybeUserId) {
   };
 }
 
-async function loadLedgerSpendMicrosForUser(client, userId) {
-  const result = await client.query(
+async function loadLedgerSpendMicrosForUser(clientOrUserId, maybeUserId) {
+  const client = maybeUserId === undefined ? null : clientOrUserId;
+  const userId = maybeUserId === undefined ? clientOrUserId : maybeUserId;
+  const runner = client ?? { query };
+
+  const result = await runner.query(
     `SELECT COALESCE(SUM(amount::numeric), 0)::text AS total
      FROM ledger
      WHERE user_id = $1
@@ -328,6 +332,19 @@ async function loadLedgerSpendMicrosForUser(client, userId) {
   }
 
   return parseUsdcAmountToMicros(totalText, 'ledger.total');
+}
+
+function buildComputedBudgetState(policy, spendMicros) {
+  const weeklyBudgetMicros = parseUsdcAmountToMicros(String(policy.weeklyBudget), 'weeklyBudget');
+  const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
+  const remainingWeeklyMicros = weeklyBudgetMicros > spendMicros ? weeklyBudgetMicros - spendMicros : 0n;
+  const maxSuggestableMicros = perTipCapMicros < remainingWeeklyMicros ? perTipCapMicros : remainingWeeklyMicros;
+
+  return {
+    spentThisWeek: normalizeNumber(formatUsdcAmount(spendMicros)),
+    remainingWeekly: normalizeNumber(formatUsdcAmount(remainingWeeklyMicros)),
+    maxSuggestable: normalizeNumber(formatUsdcAmount(maxSuggestableMicros)),
+  };
 }
 
 async function resolveLedgerFailureReasonColumn(client) {
@@ -817,12 +834,16 @@ async function handleMePolicyGet(req, res, responseHeaders) {
   }
 
   try {
-    const { policyRow, allowlistRows } = await loadUserPolicyBundle(null, req.userId);
+    const [{ policyRow, allowlistRows }, spendMicros] = await Promise.all([
+      loadUserPolicyBundle(req.userId),
+      loadLedgerSpendMicrosForUser(req.userId),
+    ]);
     const policy = policyRow ? normalizePolicyRow(policyRow) : { ...defaultAgentPolicy };
 
     sendJson(res, 200, {
       ...policy,
       allowlist: allowlistRows,
+      ...buildComputedBudgetState(policy, spendMicros),
     }, responseHeaders);
   } catch (error) {
     if (isDatabaseUnavailableError(error)) {
