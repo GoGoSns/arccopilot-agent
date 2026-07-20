@@ -49,6 +49,8 @@ Runtime config:
 - `HOST` defaults to `0.0.0.0` when `PORT` is set, otherwise `127.0.0.1`.
 - `AGENT_BEARER_TOKEN` overrides `.token`.
 - `WALLET_ID` and `WALLET_ADDRESS` override `wallet.json`.
+- `X402_SELLER_ADDRESS` optionally selects the Arc Testnet address that receives x402 nanopayments. It falls back to `WALLET_ADDRESS`.
+- `X402_DEMO_PRICE_USDC` sets the paid Arc insight price and defaults to `0.001` USDC.
 - `DATABASE_URL` enables the new SIWE-style auth/session layer. If it is missing or unreachable, the server still boots in single-operator mode and logs a warning.
 - `SCHEDULE_POLL_INTERVAL_MS` optionally changes scheduled-payment polling. Values are clamped from 5 seconds to 5 minutes, with a 30-second default.
 - `SCHEDULE_FAILURE_PAUSE_THRESHOLD` controls automatic pause after consecutive failed occurrences. The default is 3 and values are clamped from 1 to 10.
@@ -58,6 +60,8 @@ Runtime config:
 Endpoints:
 
 - `GET /health` -> `{ ok: true }`
+- `GET /x402/info` returns the public x402 capability, price, Arc network, and seller configuration.
+- `GET /x402/arc-insight` returns `402 Payment Required` until a valid Circle Gateway payment signature is supplied, then returns the paid Arc insight.
 - `POST /agent/tip` with bearer auth and JSON body `{ "recipient": "...", "amount": "..." }`
 - `GET /agent/tip/:id` with bearer auth for Circle transaction polling
 - `POST /auth/nonce` with JSON body `{ "address": "0x..." }`
@@ -132,6 +136,8 @@ Set these env vars in Railway:
 - `ALLOWLIST`
 - `SCHEDULE_FAILURE_PAUSE_THRESHOLD` (optional)
 - `CIRCLE_RECONCILIATION_INTERVAL_MS` (optional)
+- `X402_SELLER_ADDRESS` (optional; falls back to `WALLET_ADDRESS`)
+- `X402_DEMO_PRICE_USDC` (optional; defaults to `0.001`)
 
 Use the `WALLET_ID` and `WALLET_ADDRESS` values from your local `wallet.json`. Keep the Circle API and entity secret values in Railway only.
 

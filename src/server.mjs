@@ -47,6 +47,7 @@ import {
   updateScheduledPayment,
 } from './scheduled-payments.mjs';
 import { buildSchedulePreflight, extractArcWalletBalances } from './schedule-preflight.mjs';
+import { createX402Service } from './x402.mjs';
 import { isCircleApiError, loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
@@ -65,7 +66,8 @@ function resolveServerPort() {
 const corsHeaders = Object.freeze({
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type, Payment-Signature',
+  'Access-Control-Expose-Headers': 'Payment-Required, Payment-Response',
   'Access-Control-Max-Age': '86400',
 });
 
@@ -108,7 +110,7 @@ function sendNoContent(res, statusCode, headers = {}) {
 }
 
 function isCorsRoute(pathname) {
-  return pathname === '/me' || pathname.startsWith('/me/') || pathname === '/agent' || pathname.startsWith('/agent/') || pathname === '/auth' || pathname.startsWith('/auth/');
+  return pathname === '/me' || pathname.startsWith('/me/') || pathname === '/agent' || pathname.startsWith('/agent/') || pathname === '/auth' || pathname.startsWith('/auth/') || pathname === '/x402' || pathname.startsWith('/x402/');
 }
 
 function getHeader(req, name) {
@@ -549,6 +551,7 @@ async function createServerState() {
     dbReady,
     token: tokenInfo.token,
     tokenSource: tokenInfo.source,
+    x402: createX402Service(),
   };
 }
 
@@ -1750,6 +1753,16 @@ async function requestHandler(req, res, state) {
 
     if (req.method === 'GET' && pathname === '/health') {
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/x402/info') {
+      sendJson(res, 200, state.x402.getInfo(), responseHeaders);
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/x402/arc-insight') {
+      await state.x402.handlePaidResource(req, res, { sendJson, responseHeaders });
       return;
     }
 
