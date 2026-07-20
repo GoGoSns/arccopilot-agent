@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   maximumScheduleIntervalHours,
   normalizeScheduleInput,
+  resolveFailurePauseThreshold,
 } from '../src/scheduled-payments.mjs';
 
 const recipient = '0xB87B6D1a56bB7942bd07b6B0e9540a63b3dA4365';
@@ -81,4 +82,11 @@ test('rejects unsafe interval, amount, and start time values', () => {
     intervalHours: 24,
     firstRunAt: '2026-07-20T11:00:00.000Z',
   }, { nowMs }), /past/);
+});
+
+test('bounds the automatic failure pause threshold', () => {
+  assert.equal(resolveFailurePauseThreshold(undefined), 3);
+  assert.equal(resolveFailurePauseThreshold('0'), 1);
+  assert.equal(resolveFailurePauseThreshold('4'), 4);
+  assert.equal(resolveFailurePauseThreshold('99'), 10);
 });

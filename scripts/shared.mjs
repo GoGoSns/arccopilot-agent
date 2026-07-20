@@ -13,7 +13,7 @@ export const recoveryFilePath = path.join(circleDir, 'entity-secret-recovery.dat
 export const arcBlockchain = 'ARC-TESTNET';
 export const arcUsdcTokenAddress = '0x3600000000000000000000000000000000000000';
 export const arcScanTxBaseUrl = 'https://testnet.arcscan.app/tx/';
-export const terminalStates = new Set(['COMPLETE', 'FAILED', 'DENIED', 'CANCELLED', 'STUCK']);
+export const terminalStates = new Set(['COMPLETE', 'FAILED', 'DENIED', 'CANCELLED']);
 
 export function loadEnv() {
   dotenv.config({ path: path.join(rootDir, '.env') });

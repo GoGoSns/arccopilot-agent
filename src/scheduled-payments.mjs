@@ -11,6 +11,14 @@ const minimumPollIntervalMs = 5_000;
 const maximumPollIntervalMs = 5 * 60_000;
 const scheduleBatchSize = 10;
 const abandonedRunMinutes = 15;
+const defaultFailurePauseThreshold = 3;
+const maximumFailurePauseThreshold = 10;
+
+export function resolveFailurePauseThreshold(value = process.env.SCHEDULE_FAILURE_PAUSE_THRESHOLD) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return defaultFailurePauseThreshold;
+  return Math.min(maximumFailurePauseThreshold, Math.max(1, parsed));
+}
 
 function normalizeBoolean(value, fallback = null) {
   if (value === undefined || value === null) return fallback;
@@ -114,8 +122,25 @@ export function normalizeScheduleRow(row) {
     lastRunAt: row?.last_run_at ?? row?.lastRunAt ?? null,
     lastStatus: row?.last_status ?? row?.lastStatus ?? null,
     lastError: row?.last_error ?? row?.lastError ?? null,
+    consecutiveFailures: Number(row?.consecutive_failures ?? row?.consecutiveFailures ?? 0),
+    pausedReason: row?.paused_reason ?? row?.pausedReason ?? null,
     createdAt: row?.created_at ?? row?.createdAt ?? null,
     updatedAt: row?.updated_at ?? row?.updatedAt ?? null,
+  };
+}
+
+export function normalizeScheduleRunRow(row) {
+  return {
+    id: String(row?.id ?? ''),
+    scheduledFor: row?.scheduled_for ?? row?.scheduledFor ?? null,
+    status: String(row?.status ?? ''),
+    attempts: Number(row?.attempts ?? 0),
+    circleTransactionId: row?.circle_transaction_id ?? row?.circleTransactionId ?? null,
+    txHash: row?.tx_hash ?? row?.txHash ?? null,
+    error: row?.error ?? null,
+    createdAt: row?.created_at ?? row?.createdAt ?? null,
+    startedAt: row?.started_at ?? row?.startedAt ?? null,
+    completedAt: row?.completed_at ?? row?.completedAt ?? null,
   };
 }
 
@@ -133,6 +158,8 @@ export async function ensureScheduledPaymentsSchema() {
        last_run_at TIMESTAMPTZ,
        last_status VARCHAR(20),
        last_error TEXT,
+       consecutive_failures INTEGER NOT NULL DEFAULT 0,
+       paused_reason TEXT,
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
        deleted_at TIMESTAMPTZ
@@ -163,6 +190,7 @@ export async function ensureScheduledPaymentsSchema() {
        status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'complete', 'failed', 'cancelled')),
        attempts INTEGER NOT NULL DEFAULT 0,
        ledger_id UUID REFERENCES ledger(id) ON DELETE SET NULL,
+       circle_transaction_id VARCHAR(100),
        tx_hash VARCHAR(66),
        error TEXT,
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -176,12 +204,30 @@ export async function ensureScheduledPaymentsSchema() {
     `CREATE INDEX IF NOT EXISTS scheduled_payment_runs_work_idx
      ON scheduled_payment_runs (status, created_at)`,
   );
+
+  await query(
+    `ALTER TABLE scheduled_payments
+       ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0,
+       ADD COLUMN IF NOT EXISTS paused_reason TEXT`,
+  );
+
+  await query(
+    `ALTER TABLE scheduled_payment_runs
+       ADD COLUMN IF NOT EXISTS circle_transaction_id VARCHAR(100)`,
+  );
+
+  await query(
+    `CREATE INDEX IF NOT EXISTS scheduled_payment_runs_circle_tx_idx
+     ON scheduled_payment_runs (circle_transaction_id)
+     WHERE circle_transaction_id IS NOT NULL`,
+  );
 }
 
 export async function listScheduledPayments(userId) {
   const result = await query(
     `SELECT id, recipient, amount::text AS amount, label, interval_hours, next_run_at,
-            enabled, last_run_at, last_status, last_error, created_at, updated_at
+            enabled, last_run_at, last_status, last_error, consecutive_failures, paused_reason,
+            created_at, updated_at
      FROM scheduled_payments
      WHERE user_id = $1 AND deleted_at IS NULL
      ORDER BY created_at DESC`,
@@ -197,7 +243,8 @@ export async function createScheduledPayment(userId, input) {
        (id, user_id, recipient, amount, label, interval_hours, next_run_at, enabled, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
      RETURNING id, recipient, amount::text AS amount, label, interval_hours, next_run_at,
-               enabled, last_run_at, last_status, last_error, created_at, updated_at`,
+               enabled, last_run_at, last_status, last_error, consecutive_failures, paused_reason,
+               created_at, updated_at`,
     [
       id,
       userId,
@@ -246,16 +293,37 @@ export async function updateScheduledPayment(userId, scheduleId, patch) {
            interval_hours = $4,
            next_run_at = $5,
            enabled = $6,
-           last_error = CASE WHEN $6 THEN NULL ELSE last_error END,
+           last_error = CASE WHEN $6 AND NOT enabled THEN NULL ELSE last_error END,
+           consecutive_failures = CASE WHEN $6 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+           paused_reason = CASE WHEN $6 AND NOT enabled THEN NULL ELSE paused_reason END,
            updated_at = NOW()
        WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL
        RETURNING id, recipient, amount::text AS amount, label, interval_hours, next_run_at,
-                 enabled, last_run_at, last_status, last_error, created_at, updated_at`,
+                 enabled, last_run_at, last_status, last_error, consecutive_failures, paused_reason,
+                 created_at, updated_at`,
       [next.recipient, next.amount, next.label, next.intervalHours, next.nextRunAt, next.enabled, scheduleId, userId],
     );
 
     return normalizeScheduleRow(result.rows[0]);
   });
+}
+
+export async function listScheduledPaymentRuns(userId, scheduleId, limit = 10) {
+  const safeLimit = Math.min(25, Math.max(1, Number.parseInt(String(limit), 10) || 10));
+  const result = await query(
+    `SELECT r.id, r.scheduled_for, r.status, r.attempts, r.circle_transaction_id,
+            r.tx_hash, r.error, r.created_at, r.started_at, r.completed_at
+     FROM scheduled_payment_runs r
+     JOIN scheduled_payments s ON s.id = r.scheduled_payment_id
+     WHERE r.scheduled_payment_id = $1
+       AND r.user_id = $2
+       AND s.user_id = $2
+       AND s.deleted_at IS NULL
+     ORDER BY r.scheduled_for DESC
+     LIMIT $3`,
+    [scheduleId, userId, safeLimit],
+  );
+  return result.rows.map(normalizeScheduleRunRow);
 }
 
 export async function deleteScheduledPayment(userId, scheduleId) {
@@ -381,15 +449,18 @@ async function cancelRun(runId) {
 
 async function completeRun(run, result) {
   await withTransaction(async (client) => {
-    await client.query(
+    const runResult = await client.query(
       `UPDATE scheduled_payment_runs
        SET status = 'complete', tx_hash = $1, error = NULL, completed_at = NOW()
-       WHERE id = $2`,
+       WHERE id = $2 AND status NOT IN ('complete', 'failed', 'cancelled')
+       RETURNING scheduled_payment_id`,
       [result.txHash ?? null, run.id],
     );
+    if (!runResult.rows[0]) return;
     await client.query(
       `UPDATE scheduled_payments
-       SET last_run_at = NOW(), last_status = 'complete', last_error = NULL, updated_at = NOW()
+       SET last_run_at = NOW(), last_status = 'complete', last_error = NULL,
+           consecutive_failures = 0, paused_reason = NULL, updated_at = NOW()
        WHERE id = $1`,
       [run.scheduled_payment_id],
     );
@@ -399,19 +470,87 @@ async function completeRun(run, result) {
 async function failRun(run, error) {
   const reason = normalizeCircleError(error).text.slice(0, 2000);
   await withTransaction(async (client) => {
-    await client.query(
+    const runResult = await client.query(
       `UPDATE scheduled_payment_runs
        SET status = 'failed', error = $1, completed_at = NOW()
-       WHERE id = $2`,
+       WHERE id = $2 AND status NOT IN ('complete', 'failed', 'cancelled')
+       RETURNING scheduled_payment_id`,
       [reason, run.id],
     );
-    await client.query(
-      `UPDATE scheduled_payments
-       SET last_run_at = NOW(), last_status = 'failed', last_error = $1, updated_at = NOW()
-       WHERE id = $2`,
-      [reason, run.scheduled_payment_id],
-    );
+    if (!runResult.rows[0]) return;
+    await recordScheduleFailure(client, run.scheduled_payment_id, reason);
   });
+}
+
+async function recordScheduleFailure(client, scheduleId, reason) {
+  const threshold = resolveFailurePauseThreshold();
+  const pauseReason = `Paused automatically after ${threshold} consecutive failures. Last error: ${reason}`.slice(0, 2000);
+  await client.query(
+    `UPDATE scheduled_payments
+     SET last_run_at = NOW(),
+         last_error = $1,
+         consecutive_failures = consecutive_failures + 1,
+         enabled = CASE WHEN consecutive_failures + 1 >= $3 THEN FALSE ELSE enabled END,
+         last_status = CASE WHEN consecutive_failures + 1 >= $3 THEN 'paused' ELSE 'failed' END,
+         paused_reason = CASE WHEN consecutive_failures + 1 >= $3 THEN $2 ELSE paused_reason END,
+         updated_at = NOW()
+     WHERE id = $4`,
+    [reason, pauseReason, threshold, scheduleId],
+  );
+}
+
+export async function applyScheduledRunTransactionStatus(client, ledgerIds, status) {
+  if (!Array.isArray(ledgerIds) || ledgerIds.length === 0) return 0;
+
+  const state = String(status?.state ?? '').toUpperCase();
+  const txHash = status?.txHash ?? null;
+  const error = String(status?.error ?? status?.errorReason ?? status?.errorDetails ?? `Circle transaction ${state}.`).slice(0, 2000);
+  let runResult;
+
+  if (state === 'COMPLETE') {
+    runResult = await client.query(
+      `UPDATE scheduled_payment_runs
+       SET status = 'complete', tx_hash = COALESCE($1, tx_hash), error = NULL, completed_at = NOW()
+       WHERE ledger_id = ANY($2::uuid[])
+         AND status NOT IN ('complete', 'failed', 'cancelled')
+       RETURNING scheduled_payment_id`,
+      [txHash, ledgerIds],
+    );
+  } else if (['FAILED', 'DENIED', 'CANCELLED'].includes(state)) {
+    runResult = await client.query(
+      `UPDATE scheduled_payment_runs
+       SET status = 'failed', tx_hash = COALESCE($1, tx_hash), error = $2, completed_at = NOW()
+       WHERE ledger_id = ANY($3::uuid[])
+         AND status NOT IN ('complete', 'failed', 'cancelled')
+       RETURNING scheduled_payment_id`,
+      [txHash, error, ledgerIds],
+    );
+  } else {
+    await client.query(
+      `UPDATE scheduled_payment_runs
+       SET tx_hash = COALESCE($1, tx_hash)
+       WHERE ledger_id = ANY($2::uuid[])`,
+      [txHash, ledgerIds],
+    );
+    return 0;
+  }
+
+  const scheduleIds = [...new Set(runResult.rows.map((row) => row.scheduled_payment_id))];
+  for (const scheduleId of scheduleIds) {
+    if (state === 'COMPLETE') {
+      await client.query(
+        `UPDATE scheduled_payments
+         SET last_run_at = NOW(), last_status = 'complete', last_error = NULL,
+             consecutive_failures = 0, paused_reason = NULL, updated_at = NOW()
+         WHERE id = $1`,
+        [scheduleId],
+      );
+    } else {
+      await recordScheduleFailure(client, scheduleId, error);
+    }
+  }
+
+  return runResult.rowCount;
 }
 
 async function releaseRunForRetry(run, error) {
@@ -525,6 +664,15 @@ export async function attachLedgerToScheduledRun(client, runId, ledgerId) {
      SET ledger_id = $1
      WHERE id = $2 AND ledger_id IS NULL`,
     [ledgerId, runId],
+  );
+}
+
+export async function attachCircleTransactionToScheduledRun(client, runId, transactionId) {
+  await client.query(
+    `UPDATE scheduled_payment_runs
+     SET circle_transaction_id = $1
+     WHERE id = $2 AND circle_transaction_id IS NULL`,
+    [transactionId, runId],
   );
 }
 

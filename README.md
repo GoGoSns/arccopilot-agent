@@ -51,6 +51,8 @@ Runtime config:
 - `WALLET_ID` and `WALLET_ADDRESS` override `wallet.json`.
 - `DATABASE_URL` enables the new SIWE-style auth/session layer. If it is missing or unreachable, the server still boots in single-operator mode and logs a warning.
 - `SCHEDULE_POLL_INTERVAL_MS` optionally changes scheduled-payment polling. Values are clamped from 5 seconds to 5 minutes, with a 30-second default.
+- `SCHEDULE_FAILURE_PAUSE_THRESHOLD` controls automatic pause after consecutive failed occurrences. The default is 3 and values are clamped from 1 to 10.
+- `CIRCLE_RECONCILIATION_INTERVAL_MS` controls recovery polling for submitted transactions that remain pending after a restart. The default is 60 seconds.
 - `WEEKLY_BUDGET`, `PER_TIP_CAP`, and `ALLOWLIST` override `policy.json`.
 
 Endpoints:
@@ -71,14 +73,24 @@ Endpoints:
 - `POST /me/schedule` with `{ "recipient": "...", "amount": "...", "intervalHours": 168, "firstRunAt": "<ISO timestamp>", "label": "..." }`
 - `PUT /me/schedule/:id` to pause, resume, or update a recurring payment
 - `DELETE /me/schedule/:id` to remove a recurring payment
+- `GET /me/schedule/:id/runs` for the latest execution history of one recurring payment
+- `POST /webhooks/circle` for signed Circle transaction notifications
 
 Scheduled-payment notes:
 
-- The server creates the `scheduled_payments` and `scheduled_payment_runs` tables at startup. The same DDL is available in `migrations/001_scheduled_payments.sql` for review or manual migration.
+- The server creates and upgrades the reliability tables at startup. The same DDL is available in the `migrations` directory for review or manual migration.
 - Each occurrence has a stable UUID used as the Circle idempotency key. A unique database constraint prevents duplicate occurrences.
 - Missed intervals are not replayed in a burst after downtime. The next occurrence is scheduled one interval after recovery.
 - Every occurrence rechecks wallet provisioning, autonomous mode, the allowlist, per-tip cap, weekly budget, and live Circle transfer outcome.
 - Only terminal `COMPLETE` Circle transactions are reported as successful. Failures remain visible on the schedule for inspection.
+- Three consecutive failed occurrences pause the affected schedule by default. Manually resuming it clears the failure streak.
+- Circle transaction ids are persisted as soon as submission succeeds, allowing signed webhooks and the reconciliation worker to finish interrupted runs without creating a second transfer.
+
+Circle webhook setup:
+
+- Register `https://<your-railway-domain>/webhooks/circle` as a notification endpoint in Circle Console.
+- The endpoint verifies the raw request body with `X-Circle-Key-Id` and `X-Circle-Signature` before parsing or storing the event.
+- Notification ids are stored uniquely, so Circle retries are safe and idempotent.
 
 Policy is enforced from `policy.json` or the env overrides above:
 
@@ -117,6 +129,8 @@ Set these env vars in Railway:
 - `WEEKLY_BUDGET`
 - `PER_TIP_CAP`
 - `ALLOWLIST`
+- `SCHEDULE_FAILURE_PAUSE_THRESHOLD` (optional)
+- `CIRCLE_RECONCILIATION_INTERVAL_MS` (optional)
 
 Use the `WALLET_ID` and `WALLET_ADDRESS` values from your local `wallet.json`. Keep the Circle API and entity secret values in Railway only.
 

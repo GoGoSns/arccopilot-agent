@@ -372,6 +372,7 @@ export async function submitTipTransfer(
     walletId = context.walletId,
     idempotencyKey = crypto.randomUUID(),
     pollIntervalMs = 5000,
+    onSubmitted,
     onState,
   } = {},
 ) {
@@ -396,6 +397,8 @@ export async function submitTipTransfer(
   if (!txId) {
     throw new Error('createTransaction did not return a transaction id.');
   }
+
+  await onSubmitted?.(txId, createResponse);
 
   return waitForCircleTipCompletion(context.client, txId, { pollIntervalMs, onState });
 }

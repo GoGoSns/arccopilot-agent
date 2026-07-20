@@ -16,6 +16,13 @@ import {
 } from './agentProvision.mjs';
 import { closeDb, initDb, query, withTransaction } from './db.mjs';
 import {
+  ensureCircleWebhookSchema,
+  parseCircleWebhookPayload,
+  recordCircleWebhookEvent,
+  startCircleReconciliationWorker,
+  verifyCircleWebhookSignature,
+} from './circle-webhooks.mjs';
+import {
   appendLedgerEntry,
   createCircleTipContext,
   fetchCircleTipStatus,
@@ -28,10 +35,12 @@ import {
   sumLedgerSpendMicros,
 } from './arc-tip-service.mjs';
 import {
+  attachCircleTransactionToScheduledRun,
   attachLedgerToScheduledRun,
   createScheduledPayment,
   deleteScheduledPayment,
   ensureScheduledPaymentsSchema,
+  listScheduledPaymentRuns,
   listScheduledPayments,
   normalizeScheduleInput,
   startScheduledPaymentsWorker,
@@ -127,6 +136,20 @@ function isAuthorized(req, bearerToken) {
 }
 
 async function readJsonBody(req, maxBytes = 16 * 1024) {
+  const body = await readRawBody(req, maxBytes);
+  if (body.length === 0) return {};
+
+  const raw = body.toString('utf8').trim();
+  if (!raw) return {};
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new HttpError(400, 'Request body must be valid JSON.');
+  }
+}
+
+async function readRawBody(req, maxBytes = 16 * 1024) {
   const chunks = [];
   let total = 0;
 
@@ -139,20 +162,7 @@ async function readJsonBody(req, maxBytes = 16 * 1024) {
     chunks.push(buffer);
   }
 
-  if (chunks.length === 0) {
-    return {};
-  }
-
-  const raw = Buffer.concat(chunks).toString('utf8').trim();
-  if (!raw) {
-    return {};
-  }
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new HttpError(400, 'Request body must be valid JSON.');
-  }
+  return Buffer.concat(chunks);
 }
 
 function normalizePath(pathname) {
@@ -181,6 +191,15 @@ function routeMatchesScheduleItem(pathname) {
 
 function extractScheduleId(pathname) {
   return pathname.split('/').filter(Boolean)[2];
+}
+
+function routeMatchesScheduleRuns(pathname) {
+  const parts = pathname.split('/').filter(Boolean);
+  return parts.length === 4
+    && parts[0] === 'me'
+    && parts[1] === 'schedule'
+    && parts[3] === 'runs'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parts[2]);
 }
 
 function validatePolicyTip(policy, ledger, recipient, amountMicros) {
@@ -414,6 +433,25 @@ async function insertPendingLedgerRow(client, userId, recipient, amountText) {
   return result.rows[0]?.id ?? null;
 }
 
+async function attachCircleTransaction(ledgerId, scheduledRunId, transactionId) {
+  await withTransaction(async (client) => {
+    const result = await client.query(
+      `UPDATE ledger
+       SET circle_transaction_id = $1
+       WHERE id = $2
+         AND (circle_transaction_id IS NULL OR circle_transaction_id = $1)
+       RETURNING id`,
+      [transactionId, ledgerId],
+    );
+    if (!result.rows[0]) {
+      throw new Error('The ledger entry is already linked to a different Circle transaction.');
+    }
+    if (scheduledRunId) {
+      await attachCircleTransactionToScheduledRun(client, scheduledRunId, transactionId);
+    }
+  });
+}
+
 async function markLedgerTipComplete(ledgerId, txHash) {
   await query(
     `UPDATE ledger
@@ -502,6 +540,7 @@ async function createServerState() {
   const dbReady = await initDb();
   if (dbReady) {
     await ensureScheduledPaymentsSchema();
+    await ensureCircleWebhookSchema();
   }
   const [context, tokenInfo] = await Promise.all([createCircleTipContext(), loadOrCreateBearerToken()]);
   return {
@@ -643,6 +682,14 @@ async function executeUserAgentTip({
         amount: amountText,
         walletId: prep.walletId,
         ...(idempotencyKey ? { idempotencyKey } : {}),
+        onSubmitted: async (transactionId) => {
+          try {
+            await attachCircleTransaction(prep.ledgerId, scheduledRunId, transactionId);
+          } catch (error) {
+            if (scheduledRunId) throw error;
+            console.warn(`[ledger] Could not attach Circle transaction ${transactionId}: ${normalizeCircleError(error).text}`);
+          }
+        },
       });
 
       if (String(transfer.state).toUpperCase() !== 'COMPLETE') {
@@ -1318,6 +1365,81 @@ async function handleMeScheduleGet(req, res, responseHeaders) {
   }
 }
 
+async function handleMeScheduleRunsGet(req, res, pathname, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  try {
+    const scheduleId = extractScheduleId(pathname);
+    const schedules = await listScheduledPayments(req.userId);
+    if (!schedules.some((entry) => entry.id === scheduleId)) {
+      sendError(res, 404, 'not_found', 'Scheduled payment not found.', {}, responseHeaders);
+      return;
+    }
+    sendJson(res, 200, { runs: await listScheduledPaymentRuns(req.userId, scheduleId) }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function handleCircleWebhookPost(req, res) {
+  const keyId = String(getHeader(req, 'x-circle-key-id') ?? '').trim();
+  const signature = String(getHeader(req, 'x-circle-signature') ?? '').trim();
+  if (!keyId || !signature) {
+    sendError(res, 401, 'invalid_signature', 'Circle webhook signature headers are required.');
+    return;
+  }
+
+  const rawBody = await readRawBody(req, 256 * 1024);
+  if (rawBody.length === 0) {
+    sendError(res, 400, 'invalid_request', 'Circle webhook body is required.');
+    return;
+  }
+
+  let verified;
+  try {
+    verified = await verifyCircleWebhookSignature({
+      rawBody,
+      keyId,
+      signature,
+      apiKey: process.env.CIRCLE_API_KEY,
+    });
+  } catch (error) {
+    console.warn(`[circle-webhook] Signature verification unavailable: ${normalizeCircleError(error).text}`);
+    sendError(res, 503, 'service_unavailable', 'Circle webhook signature verification is temporarily unavailable.');
+    return;
+  }
+  if (!verified) {
+    sendError(res, 401, 'invalid_signature', 'Circle webhook signature is invalid.');
+    return;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    sendError(res, 400, 'invalid_request', 'Circle webhook body must be valid JSON.');
+    return;
+  }
+
+  const parsed = parseCircleWebhookPayload(payload);
+  if (!parsed.notificationId) {
+    sendError(res, 400, 'invalid_request', 'Circle webhook payload is missing notificationId.');
+    return;
+  }
+
+  const result = await recordCircleWebhookEvent(payload, parsed);
+  sendJson(res, 200, {
+    received: true,
+    duplicate: result.duplicate,
+    matched: result.matched,
+  });
+}
+
 async function handleMeSchedulePost(req, res, responseHeaders) {
   const session = await authMiddleware(req, res, responseHeaders);
   if (!session) return;
@@ -1576,6 +1698,11 @@ async function requestHandler(req, res, state) {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/webhooks/circle') {
+      await handleCircleWebhookPost(req, res);
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/agent/tip') {
       await handleTipPost(req, res, state, responseHeaders);
       return;
@@ -1646,6 +1773,11 @@ async function requestHandler(req, res, state) {
       return;
     }
 
+    if (req.method === 'GET' && routeMatchesScheduleRuns(pathname)) {
+      await handleMeScheduleRunsGet(req, res, pathname, responseHeaders);
+      return;
+    }
+
     if (req.method === 'PUT' && routeMatchesScheduleItem(pathname)) {
       await handleMeSchedulePut(req, res, pathname, responseHeaders);
       return;
@@ -1702,6 +1834,11 @@ export async function startServer({ host = resolveServerHost(), port = resolveSe
       }),
     })
     : null;
+  const circleReconciliationWorker = state.dbReady
+    ? startCircleReconciliationWorker({
+      fetchStatus: (transactionId) => fetchCircleTipStatus(state.context.client, transactionId),
+    })
+    : null;
   console.log(`[server] Listening on http://${host}:${actualPort}`);
   if (state.tokenSource === 'env') {
     console.log('[server] Bearer token source: AGENT_BEARER_TOKEN');
@@ -1719,6 +1856,7 @@ export async function startServer({ host = resolveServerHost(), port = resolveSe
     close: async () => {
       await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
       await scheduledPaymentsWorker?.stop();
+      await circleReconciliationWorker?.stop();
       await closeDb();
     },
   };
