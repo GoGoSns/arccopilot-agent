@@ -71,6 +71,7 @@ Endpoints:
 - `GET /me/ledger` for the latest per-user autonomous payments
 - `GET /me/schedule` for the current user's recurring payment rules
 - `POST /me/schedule` with `{ "recipient": "...", "amount": "...", "intervalHours": 168, "firstRunAt": "<ISO timestamp>", "label": "..." }`
+- `POST /me/schedule/preflight` with the same draft body for a read-only wallet, policy, budget, token-balance, and Arc-gas readiness check
 - `PUT /me/schedule/:id` to pause, resume, or update a recurring payment
 - `DELETE /me/schedule/:id` to remove a recurring payment
 - `GET /me/schedule/:id/runs` for the latest execution history of one recurring payment

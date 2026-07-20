@@ -46,6 +46,7 @@ import {
   startScheduledPaymentsWorker,
   updateScheduledPayment,
 } from './scheduled-payments.mjs';
+import { buildSchedulePreflight, extractArcWalletBalances } from './schedule-preflight.mjs';
 import { isCircleApiError, loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
@@ -1338,6 +1339,47 @@ async function validateScheduledPaymentDraft(userId, draft) {
   });
 }
 
+async function loadScheduledPaymentPreflight(userId, draft, state) {
+  const snapshot = await withTransaction(async (client) => {
+    const { walletRow, policy, allowlistRows } = await loadUserAutonomousTipState(client, userId);
+    const reservedWeeklyMicros = await loadReservedLedgerSpendMicrosForUser(client, userId);
+    return {
+      walletRow,
+      policy,
+      allowlistRows,
+      reservedWeeklyMicros,
+    };
+  });
+
+  const walletReady = Boolean(
+    snapshot.walletRow?.circle_wallet_id
+    && snapshot.walletRow?.agent_address,
+  );
+  let balances = { available: false, usdc: null, native: null };
+  if (walletReady) {
+    try {
+      const response = await state.context.client.getWalletTokenBalance({
+        id: snapshot.walletRow.circle_wallet_id,
+      });
+      balances = extractArcWalletBalances(response);
+    } catch (error) {
+      console.warn(`[schedule-preflight] Balance lookup failed for user ${userId}: ${normalizeCircleError(error).text}`);
+    }
+  }
+
+  return buildSchedulePreflight({
+    recipient: draft.recipient,
+    amount: draft.amount,
+    walletReady,
+    autonomousEnabled: snapshot.policy.autonomousEnabled,
+    allowlist: snapshot.allowlistRows,
+    perTipCap: snapshot.policy.perTipCap,
+    weeklyBudget: snapshot.policy.weeklyBudget,
+    reservedWeeklyMicros: snapshot.reservedWeeklyMicros,
+    balances,
+  });
+}
+
 function sendScheduledPaymentError(res, error, responseHeaders) {
   if (error instanceof HttpError) {
     sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
@@ -1383,6 +1425,19 @@ async function handleMeScheduleRunsGet(req, res, pathname, responseHeaders) {
       return;
     }
     throw error;
+  }
+}
+
+async function handleMeSchedulePreflightPost(req, res, state, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  try {
+    const input = normalizeScheduleInput(await readJsonBody(req));
+    const preflight = await loadScheduledPaymentPreflight(req.userId, input, state);
+    sendJson(res, 200, { preflight }, responseHeaders);
+  } catch (error) {
+    sendScheduledPaymentError(res, error, responseHeaders);
   }
 }
 
@@ -1765,6 +1820,11 @@ async function requestHandler(req, res, state) {
 
     if (req.method === 'GET' && pathname === '/me/schedule') {
       await handleMeScheduleGet(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/me/schedule/preflight') {
+      await handleMeSchedulePreflightPost(req, res, state, responseHeaders);
       return;
     }
 
