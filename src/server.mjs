@@ -27,6 +27,16 @@ import {
   submitTipTransfer,
   sumLedgerSpendMicros,
 } from './arc-tip-service.mjs';
+import {
+  attachLedgerToScheduledRun,
+  createScheduledPayment,
+  deleteScheduledPayment,
+  ensureScheduledPaymentsSchema,
+  listScheduledPayments,
+  normalizeScheduleInput,
+  startScheduledPaymentsWorker,
+  updateScheduledPayment,
+} from './scheduled-payments.mjs';
 import { isCircleApiError, loadEnv, normalizeCircleError, validatePositiveAmount, validateRecipientAddress } from '../scripts/shared.mjs';
 
 const defaultPort = 8787;
@@ -158,6 +168,18 @@ function routeMatchesTipStatus(pathname) {
 }
 
 function extractTipId(pathname) {
+  return pathname.split('/').filter(Boolean)[2];
+}
+
+function routeMatchesScheduleItem(pathname) {
+  const parts = pathname.split('/').filter(Boolean);
+  return parts.length === 3
+    && parts[0] === 'me'
+    && parts[1] === 'schedule'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parts[2]);
+}
+
+function extractScheduleId(pathname) {
   return pathname.split('/').filter(Boolean)[2];
 }
 
@@ -334,6 +356,28 @@ async function loadLedgerSpendMicrosForUser(clientOrUserId, maybeUserId) {
   return parseUsdcAmountToMicros(totalText, 'ledger.total');
 }
 
+async function loadReservedLedgerSpendMicrosForUser(client, userId, excludeLedgerId = null) {
+  const result = await client.query(
+    `SELECT COALESCE(SUM(amount::numeric), 0)::text AS total
+     FROM ledger
+     WHERE user_id = $1
+       AND created_at >= NOW() - INTERVAL '7 days'
+       AND (
+         status = 'complete'
+         OR (status = 'pending' AND created_at >= NOW() - INTERVAL '1 hour')
+       )
+       AND ($2::uuid IS NULL OR id <> $2::uuid)`,
+    [userId, excludeLedgerId],
+  );
+
+  const totalText = String(result.rows[0]?.total ?? '0').trim();
+  if (!totalText || Number(totalText) === 0) {
+    return 0n;
+  }
+
+  return parseUsdcAmountToMicros(totalText, 'ledger.reservedTotal');
+}
+
 function buildComputedBudgetState(policy, spendMicros) {
   const weeklyBudgetMicros = parseUsdcAmountToMicros(String(policy.weeklyBudget), 'weeklyBudget');
   const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
@@ -455,10 +499,14 @@ async function loadUserAutonomousTipState(client, userId) {
 
 async function createServerState() {
   loadEnv();
-  await initDb();
+  const dbReady = await initDb();
+  if (dbReady) {
+    await ensureScheduledPaymentsSchema();
+  }
   const [context, tokenInfo] = await Promise.all([createCircleTipContext(), loadOrCreateBearerToken()]);
   return {
     context,
+    dbReady,
     token: tokenInfo.token,
     tokenSource: tokenInfo.source,
   };
@@ -483,6 +531,173 @@ function withExclusiveTipLock() {
 }
 
 const runExclusive = withExclusiveTipLock();
+
+async function executeUserAgentTip({
+  userId,
+  recipient: rawRecipient,
+  amount: rawAmount,
+  state,
+  idempotencyKey,
+  scheduledRunId = null,
+  existingLedgerId = null,
+}) {
+  const recipient = validateRecipientAddress(String(rawRecipient ?? '').trim()).toLowerCase();
+  const amountText = validatePositiveAmount(String(rawAmount ?? '').trim());
+  const amountMicros = parseUsdcAmountToMicros(amountText, 'amount');
+
+  return runExclusive(async () => {
+    const prep = await withTransaction(async (client) => {
+      let ledgerId = existingLedgerId;
+      if (ledgerId) {
+        const ledgerResult = await client.query(
+          `SELECT id, status, tx_hash
+           FROM ledger
+           WHERE id = $1 AND user_id = $2
+           LIMIT 1`,
+          [ledgerId, userId],
+        );
+        const ledgerRow = ledgerResult.rows[0];
+        if (!ledgerRow) {
+          throw new Error('The scheduled payment ledger reservation is missing.');
+        }
+        if (ledgerRow.status === 'complete') {
+          return {
+            alreadyComplete: true,
+            ledgerId,
+            txHash: ledgerRow.tx_hash ?? null,
+          };
+        }
+        if (ledgerRow.status === 'failed') {
+          throw new Error('The previous scheduled payment attempt failed.');
+        }
+      }
+
+      const stateBundle = await loadUserAutonomousTipState(client, userId);
+      const { walletRow, policy, allowlistRows } = stateBundle;
+
+      if (!walletRow || !walletRow.circle_wallet_id || !walletRow.agent_address) {
+        throw new HttpError(409, 'Your agent wallet is not provisioned yet. Call /agent/provision first.', {
+          hint: 'call /agent/provision first',
+        }, 'agent_wallet_not_provisioned');
+      }
+
+      if (!policy.autonomousEnabled) {
+        throw new HttpError(403, 'autonomous mode is off for this account', {}, 'autonomous_disabled');
+      }
+
+      const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
+      if (amountMicros > perTipCapMicros) {
+        throw new HttpError(400, `Amount exceeds your per-tip cap of ${formatUsdcAmount(perTipCapMicros)} USDC.`, {
+          perTipCap: formatUsdcAmount(perTipCapMicros),
+          amount: formatUsdcAmount(amountMicros),
+        }, 'invalid_request');
+      }
+
+      if (allowlistRows.length > 0 && !allowlistRows.some((entry) => entry.recipient === recipient)) {
+        throw new HttpError(400, 'recipient not in your allowlist', {
+          recipient,
+        }, 'invalid_request');
+      }
+
+      const reservedSpendMicros = await loadReservedLedgerSpendMicrosForUser(client, userId, ledgerId);
+      const weeklyBudgetMicros = parseUsdcAmountToMicros(String(policy.weeklyBudget), 'weeklyBudget');
+      if (reservedSpendMicros + amountMicros > weeklyBudgetMicros) {
+        const remainingMicros = weeklyBudgetMicros > reservedSpendMicros ? weeklyBudgetMicros - reservedSpendMicros : 0n;
+        throw new HttpError(400, `Weekly budget exceeded. Remaining budget: ${formatUsdcAmount(remainingMicros)} USDC.`, {
+          weeklyBudget: formatUsdcAmount(weeklyBudgetMicros),
+          weeklySpend: formatUsdcAmount(reservedSpendMicros),
+          requestedAmount: formatUsdcAmount(amountMicros),
+          remainingBudget: formatUsdcAmount(remainingMicros),
+        }, 'invalid_request');
+      }
+
+      if (!ledgerId) {
+        ledgerId = await insertPendingLedgerRow(client, userId, recipient, amountText);
+        if (!ledgerId) {
+          throw new Error('Failed to create a pending ledger row.');
+        }
+        if (scheduledRunId) {
+          await attachLedgerToScheduledRun(client, scheduledRunId, ledgerId);
+        }
+      }
+
+      return {
+        alreadyComplete: false,
+        ledgerId,
+        walletId: walletRow.circle_wallet_id,
+      };
+    });
+
+    if (prep.alreadyComplete) {
+      return {
+        state: 'COMPLETE',
+        txHash: prep.txHash,
+        arcscanUrl: prep.txHash ? `https://testnet.arcscan.app/tx/${prep.txHash}` : null,
+      };
+    }
+
+    let transfer;
+    try {
+      transfer = await submitTipTransfer(state.context, {
+        recipient,
+        amount: amountText,
+        walletId: prep.walletId,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+      });
+
+      if (String(transfer.state).toUpperCase() !== 'COMPLETE') {
+        const reason = normalizeTipFailure(transfer);
+        throw new HttpError(502, reason, {
+          state: transfer.state,
+          txHash: transfer.txHash ?? null,
+          arcscanUrl: transfer.arcscanUrl ?? null,
+        }, 'circle_upstream_error');
+      }
+    } catch (error) {
+      const normalized = normalizeCircleError(error);
+      const retryableScheduledError = Boolean(
+        scheduledRunId
+        && !(error instanceof HttpError)
+        && (!normalized.status || normalized.status >= 500 || [408, 409, 429].includes(normalized.status)),
+      );
+      if (retryableScheduledError) {
+        const retryError = error instanceof Error ? error : new Error(normalized.text);
+        retryError.retryScheduledRun = true;
+        throw retryError;
+      }
+
+      const reason = error instanceof HttpError ? error.message : normalized.text;
+      const txHash = error instanceof HttpError ? error.details?.txHash ?? null : null;
+      try {
+        await markLedgerTipFailed(prep.ledgerId, txHash, reason);
+      } catch (markError) {
+        console.warn(`[ledger] Could not mark failed autonomous tip for user ${userId}: ${normalizeCircleError(markError).text}`);
+      }
+      throw error;
+    }
+
+    try {
+      await markLedgerTipComplete(prep.ledgerId, transfer.txHash ?? null);
+    } catch (error) {
+      try {
+        await markLedgerTipComplete(prep.ledgerId, transfer.txHash ?? null);
+      } catch (retryError) {
+        if (scheduledRunId) {
+          const persistenceError = retryError instanceof Error ? retryError : new Error(normalizeCircleError(retryError).text);
+          persistenceError.retryScheduledRun = true;
+          throw persistenceError;
+        }
+        console.warn(`[ledger] Transfer completed but ledger update failed for user ${userId}: ${normalizeCircleError(retryError).text}`);
+      }
+    }
+
+    return {
+      state: 'COMPLETE',
+      txHash: transfer.txHash ?? null,
+      arcscanUrl: transfer.arcscanUrl ?? null,
+    };
+  });
+}
 
 async function attemptAgentWalletProvision(userId, timeoutMs, context) {
   const trackedProvision = ensureAgentWallet(userId).then(
@@ -1047,6 +1262,141 @@ async function handleMeLedgerGet(req, res, responseHeaders) {
   }
 }
 
+async function validateScheduledPaymentDraft(userId, draft) {
+  await withTransaction(async (client) => {
+    const { walletRow, policy, allowlistRows } = await loadUserAutonomousTipState(client, userId);
+    if (!walletRow || !walletRow.circle_wallet_id || !walletRow.agent_address) {
+      throw new HttpError(409, 'Your agent wallet is not provisioned yet. Call /agent/provision first.', {
+        hint: 'call /agent/provision first',
+      }, 'agent_wallet_not_provisioned');
+    }
+    if (!policy.autonomousEnabled) {
+      throw new HttpError(403, 'autonomous mode is off for this account', {}, 'autonomous_disabled');
+    }
+
+    const amountMicros = parseUsdcAmountToMicros(String(draft.amount), 'amount');
+    const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
+    if (amountMicros > perTipCapMicros) {
+      throw new HttpError(400, `Amount exceeds your per-tip cap of ${formatUsdcAmount(perTipCapMicros)} USDC.`, {
+        perTipCap: formatUsdcAmount(perTipCapMicros),
+        amount: formatUsdcAmount(amountMicros),
+      }, 'invalid_request');
+    }
+
+    if (allowlistRows.length > 0 && !allowlistRows.some((entry) => entry.recipient === draft.recipient)) {
+      throw new HttpError(400, 'recipient not in your allowlist', {
+        recipient: draft.recipient,
+      }, 'invalid_request');
+    }
+  });
+}
+
+function sendScheduledPaymentError(res, error, responseHeaders) {
+  if (error instanceof HttpError) {
+    sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
+    return;
+  }
+  if (isDatabaseUnavailableError(error)) {
+    sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+    return;
+  }
+  sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid schedule request.', {}, responseHeaders);
+}
+
+async function handleMeScheduleGet(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  try {
+    sendJson(res, 200, { schedules: await listScheduledPayments(req.userId) }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function handleMeSchedulePost(req, res, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+    const input = normalizeScheduleInput(body);
+    if (input.enabled) {
+      await validateScheduledPaymentDraft(req.userId, input);
+    }
+    const schedule = await createScheduledPayment(req.userId, input);
+    sendJson(res, 201, { schedule }, responseHeaders);
+  } catch (error) {
+    sendScheduledPaymentError(res, error, responseHeaders);
+  }
+}
+
+async function handleMeSchedulePut(req, res, pathname, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  try {
+    const scheduleId = extractScheduleId(pathname);
+    const schedules = await listScheduledPayments(req.userId);
+    const current = schedules.find((entry) => entry.id === scheduleId);
+    if (!current) {
+      sendError(res, 404, 'not_found', 'Scheduled payment not found.', {}, responseHeaders);
+      return;
+    }
+
+    const body = await readJsonBody(req);
+    const patch = normalizeScheduleInput(body, {
+      partial: true,
+      fallbackIntervalHours: current.intervalHours,
+    });
+    const draft = {
+      recipient: patch.recipient ?? current.recipient,
+      amount: patch.amount ?? current.amount,
+      intervalHours: patch.intervalHours ?? current.intervalHours,
+      firstRunAt: patch.firstRunAt ?? current.nextRunAt,
+      label: Object.hasOwn(patch, 'label') ? patch.label : current.label,
+      enabled: patch.enabled ?? current.enabled,
+    };
+    if (draft.enabled) {
+      await validateScheduledPaymentDraft(req.userId, draft);
+    }
+
+    const schedule = await updateScheduledPayment(req.userId, scheduleId, patch);
+    if (!schedule) {
+      sendError(res, 404, 'not_found', 'Scheduled payment not found.', {}, responseHeaders);
+      return;
+    }
+    sendJson(res, 200, { schedule }, responseHeaders);
+  } catch (error) {
+    sendScheduledPaymentError(res, error, responseHeaders);
+  }
+}
+
+async function handleMeScheduleDelete(req, res, pathname, responseHeaders) {
+  const session = await authMiddleware(req, res, responseHeaders);
+  if (!session) return;
+
+  try {
+    const removed = await deleteScheduledPayment(req.userId, extractScheduleId(pathname));
+    if (!removed) {
+      sendError(res, 404, 'not_found', 'Scheduled payment not found.', {}, responseHeaders);
+      return;
+    }
+    sendJson(res, 200, { removed: true }, responseHeaders);
+  } catch (error) {
+    if (isDatabaseUnavailableError(error)) {
+      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function handleMeTipPost(req, res, state, responseHeaders) {
   const session = await authMiddleware(req, res, responseHeaders);
   if (!session) {
@@ -1064,102 +1414,13 @@ async function handleMeTipPost(req, res, state, responseHeaders) {
     throw error;
   }
 
-  let recipient;
-  let amountText;
-  let amountMicros;
   try {
-    recipient = validateRecipientAddress(String(body?.recipient ?? '').trim()).toLowerCase();
-    amountText = validatePositiveAmount(String(body?.amount ?? '').trim());
-    amountMicros = parseUsdcAmountToMicros(amountText, 'amount');
-  } catch (error) {
-    sendError(res, 400, 'invalid_request', error?.message ?? 'Invalid request body.', {}, responseHeaders);
-    return;
-  }
-
-  let prep;
-  try {
-    prep = await withTransaction(async (client) => {
-      const stateBundle = await loadUserAutonomousTipState(client, req.userId);
-      const { walletRow, policy, allowlistRows, spendMicros } = stateBundle;
-
-      if (!walletRow || !walletRow.circle_wallet_id || !walletRow.agent_address) {
-        throw new HttpError(409, 'Your agent wallet is not provisioned yet. Call /agent/provision first.', {
-          hint: 'call /agent/provision first',
-        }, 'agent_wallet_not_provisioned');
-      }
-
-      if (!policy.autonomousEnabled) {
-        throw new HttpError(403, 'autonomous mode is off for this account', {}, 'autonomous_disabled');
-      }
-
-      const perTipCapMicros = parseUsdcAmountToMicros(String(policy.perTipCap), 'perTipCap');
-      if (amountMicros > perTipCapMicros) {
-        throw new HttpError(400, `Amount exceeds your per-tip cap of ${formatUsdcAmount(perTipCapMicros)} USDC.`, {
-          perTipCap: formatUsdcAmount(perTipCapMicros),
-          amount: formatUsdcAmount(amountMicros),
-        }, 'invalid_request');
-      }
-
-      if (allowlistRows.length > 0 && !allowlistRows.some((entry) => entry.recipient === recipient)) {
-        throw new HttpError(400, 'recipient not in your allowlist', {
-          recipient,
-        }, 'invalid_request');
-      }
-
-      const weeklyBudgetMicros = parseUsdcAmountToMicros(String(policy.weeklyBudget), 'weeklyBudget');
-      if (spendMicros + amountMicros > weeklyBudgetMicros) {
-        const remainingMicros = weeklyBudgetMicros > spendMicros ? weeklyBudgetMicros - spendMicros : 0n;
-        throw new HttpError(400, `Weekly budget exceeded. Remaining budget: ${formatUsdcAmount(remainingMicros)} USDC.`, {
-          weeklyBudget: formatUsdcAmount(weeklyBudgetMicros),
-          weeklySpend: formatUsdcAmount(spendMicros),
-          requestedAmount: formatUsdcAmount(amountMicros),
-          remainingBudget: formatUsdcAmount(remainingMicros),
-        }, 'invalid_request');
-      }
-
-      const ledgerId = await insertPendingLedgerRow(client, req.userId, recipient, amountText);
-      if (!ledgerId) {
-        throw new Error('Failed to create a pending ledger row.');
-      }
-
-      return {
-        ledgerId,
-        walletId: walletRow.circle_wallet_id,
-        agentAddress: walletRow.agent_address,
-      };
+    const transfer = await executeUserAgentTip({
+      userId: req.userId,
+      recipient: body?.recipient,
+      amount: body?.amount,
+      state,
     });
-  } catch (error) {
-    if (error instanceof HttpError) {
-      sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
-      return;
-    }
-
-    if (isDatabaseUnavailableError(error)) {
-      sendError(res, 503, 'service_unavailable', 'Database is unavailable.', {}, responseHeaders);
-      return;
-    }
-
-    throw error;
-  }
-
-  try {
-    const transfer = await submitTipTransfer(state.context, {
-      recipient,
-      amount: amountText,
-      walletId: prep.walletId,
-    });
-
-    if (String(transfer.state).toUpperCase() !== 'COMPLETE') {
-      const reason = normalizeTipFailure(transfer);
-      throw new HttpError(502, reason, {
-        state: transfer.state,
-        txHash: transfer.txHash ?? null,
-        arcscanUrl: transfer.arcscanUrl ?? null,
-      }, 'circle_upstream_error');
-    }
-
-    await markLedgerTipComplete(prep.ledgerId, transfer.txHash ?? null);
-
     sendJson(res, 200, {
       state: 'COMPLETE',
       txHash: transfer.txHash ?? null,
@@ -1167,26 +1428,15 @@ async function handleMeTipPost(req, res, state, responseHeaders) {
     }, responseHeaders);
   } catch (error) {
     if (error instanceof HttpError) {
-      try {
-        await markLedgerTipFailed(prep.ledgerId, error.details?.txHash ?? null, error.message);
-      } catch (markError) {
-        console.warn(`[ledger] Could not mark failed autonomous tip for user ${req.userId}: ${normalizeCircleError(markError).text}`);
-      }
       sendError(res, error.statusCode, error.errorCode, error.message, error.details, responseHeaders);
       return;
     }
 
     const normalized = normalizeCircleError(error);
-    try {
-      await markLedgerTipFailed(prep.ledgerId, null, normalized.text);
-    } catch (markError) {
-      console.warn(`[ledger] Could not mark failed autonomous tip for user ${req.userId}: ${normalizeCircleError(markError).text}`);
-    }
-
     sendError(
       res,
-      isCircleApiError(error) || normalized.status ? 502 : 500,
-      isCircleApiError(error) || normalized.status ? 'circle_upstream_error' : 'internal_error',
+      isDatabaseUnavailableError(error) ? 503 : (isCircleApiError(error) || normalized.status ? 502 : 500),
+      isDatabaseUnavailableError(error) ? 'service_unavailable' : (isCircleApiError(error) || normalized.status ? 'circle_upstream_error' : 'internal_error'),
       normalized.text,
       {},
       responseHeaders,
@@ -1386,6 +1636,26 @@ async function requestHandler(req, res, state) {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/me/schedule') {
+      await handleMeScheduleGet(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/me/schedule') {
+      await handleMeSchedulePost(req, res, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'PUT' && routeMatchesScheduleItem(pathname)) {
+      await handleMeSchedulePut(req, res, pathname, responseHeaders);
+      return;
+    }
+
+    if (req.method === 'DELETE' && routeMatchesScheduleItem(pathname)) {
+      await handleMeScheduleDelete(req, res, pathname, responseHeaders);
+      return;
+    }
+
     if (req.method === 'GET' && routeMatchesTipStatus(pathname)) {
       await handleTipStatus(req, res, state, pathname, responseHeaders);
       return;
@@ -1419,6 +1689,19 @@ export async function startServer({ host = resolveServerHost(), port = resolveSe
 
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
+  const scheduledPaymentsWorker = state.dbReady
+    ? startScheduledPaymentsWorker({
+      executePayment: (payment) => executeUserAgentTip({
+        userId: payment.userId,
+        recipient: payment.recipient,
+        amount: payment.amount,
+        state,
+        idempotencyKey: payment.idempotencyKey,
+        scheduledRunId: payment.runId,
+        existingLedgerId: payment.ledgerId,
+      }),
+    })
+    : null;
   console.log(`[server] Listening on http://${host}:${actualPort}`);
   if (state.tokenSource === 'env') {
     console.log('[server] Bearer token source: AGENT_BEARER_TOKEN');
@@ -1435,6 +1718,7 @@ export async function startServer({ host = resolveServerHost(), port = resolveSe
     context: state.context,
     close: async () => {
       await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+      await scheduledPaymentsWorker?.stop();
       await closeDb();
     },
   };

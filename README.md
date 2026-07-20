@@ -50,6 +50,7 @@ Runtime config:
 - `AGENT_BEARER_TOKEN` overrides `.token`.
 - `WALLET_ID` and `WALLET_ADDRESS` override `wallet.json`.
 - `DATABASE_URL` enables the new SIWE-style auth/session layer. If it is missing or unreachable, the server still boots in single-operator mode and logs a warning.
+- `SCHEDULE_POLL_INTERVAL_MS` optionally changes scheduled-payment polling. Values are clamped from 5 seconds to 5 minutes, with a 30-second default.
 - `WEEKLY_BUDGET`, `PER_TIP_CAP`, and `ALLOWLIST` override `policy.json`.
 
 Endpoints:
@@ -62,6 +63,22 @@ Endpoints:
 - `POST /auth/refresh` with JSON body `{ "refreshToken": "..." }`
 - `GET /me` with `Authorization: Bearer <accessToken>`
 - `POST /agent/provision` with `Authorization: Bearer <accessToken>` to retry wallet setup manually
+- `POST /me/tip` with bearer auth and JSON body `{ "recipient": "...", "amount": "..." }`
+- `GET /me/policy` and `PUT /me/policy` for server-enforced budget settings
+- `POST /me/allowlist` and `DELETE /me/allowlist` for recipient rules
+- `GET /me/ledger` for the latest per-user autonomous payments
+- `GET /me/schedule` for the current user's recurring payment rules
+- `POST /me/schedule` with `{ "recipient": "...", "amount": "...", "intervalHours": 168, "firstRunAt": "<ISO timestamp>", "label": "..." }`
+- `PUT /me/schedule/:id` to pause, resume, or update a recurring payment
+- `DELETE /me/schedule/:id` to remove a recurring payment
+
+Scheduled-payment notes:
+
+- The server creates the `scheduled_payments` and `scheduled_payment_runs` tables at startup. The same DDL is available in `migrations/001_scheduled_payments.sql` for review or manual migration.
+- Each occurrence has a stable UUID used as the Circle idempotency key. A unique database constraint prevents duplicate occurrences.
+- Missed intervals are not replayed in a burst after downtime. The next occurrence is scheduled one interval after recovery.
+- Every occurrence rechecks wallet provisioning, autonomous mode, the allowlist, per-tip cap, weekly budget, and live Circle transfer outcome.
+- Only terminal `COMPLETE` Circle transactions are reported as successful. Failures remain visible on the schedule for inspection.
 
 Policy is enforced from `policy.json` or the env overrides above:
 

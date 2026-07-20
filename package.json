@@ -9,6 +9,7 @@
     "create-wallet": "node scripts/create-wallet.mjs",
     "balance": "node scripts/balance.mjs",
     "test-transfer": "node scripts/test-transfer.mjs",
+    "test": "node --test --test-isolation=none test/*.test.mjs",
     "server": "node src/server.mjs"
   },
   "engines": {
